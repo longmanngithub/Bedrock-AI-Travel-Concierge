@@ -383,10 +383,26 @@ async def chat_stream(
         finally:
             db_lookup.close()
 
+        # The crew is a multi-minute, multi-agent run that produces no SSE
+        # frames until it settles. Left unattended, that silent gap exceeds
+        # typical reverse-proxy idle/read timeouts (default nginx is 60s) and
+        # the proxy kills the connection long before the crew finishes, even
+        # though the crew keeps running server-side to completion — this is
+        # what surfaced as "loading failed" in production but never locally,
+        # where uvicorn has no proxy in front of it. Run the crew as a task
+        # and emit an SSE comment (ignored by the client, but real bytes on
+        # the wire) every few seconds while we wait, so every hop between the
+        # browser and this process sees continuous traffic.
+        crew_task = asyncio.ensure_future(
+            run_in_threadpool(run_crew, trip_request, previous_itinerary=previous_itinerary)
+        )
         try:
-            itinerary, elapsed, _tokens = await run_in_threadpool(
-                run_crew, trip_request, previous_itinerary=previous_itinerary
-            )
+            while not crew_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(crew_task), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+            itinerary, elapsed, _tokens = crew_task.result()
         except Exception as exc:  # noqa: BLE001 - surface a plain, honest failure
             yield _sse(
                 {
