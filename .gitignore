@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+!*/.env.example
+
+# RAG vector store (regenerate with `python -m app.rag.ingest`)
+backend/app/rag/chroma_store/
+
+# Evaluation harness + outputs (not pushed to GitHub)
+backend/evaluation/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/*.tsbuildinfo
+frontend/npm-debug.log*
+
+# Docker
+*.pid
+docker-compose.override.yml
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code config (not pushed to GitHub)
+.claude/
+
+# Project report (not pushed to GitHub)
+report/
+
+# Claude Code project instructions (not pushed to GitHub)
+CLAUDE.md
+
+# Deployment
+DEPLOYMENT.md

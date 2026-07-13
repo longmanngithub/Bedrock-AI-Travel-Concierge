@@ -1,0 +1,62 @@
+name: CD (deploy to DigitalOcean)
+
+# Runs after CI succeeds on main. SSHes into the droplet, pulls the latest
+# code, and rebuilds/restarts the prod stack in place. This is the
+# git-pull-and-rebuild-on-the-host style of deploy — no container registry
+# required, which keeps setup simple for a prototype/testing deployment.
+#
+# Required repo secrets (see DEPLOYMENT.md for how to create them):
+#   DROPLET_HOST     - droplet IP or domain
+#   DROPLET_USER     - SSH user (e.g. deploy, or root)
+#   DROPLET_SSH_KEY  - private key with access to the droplet (PEM contents)
+#   DROPLET_SSH_PORT - optional, defaults to 22
+#   DEPLOY_PATH      - optional, defaults to ~/ai-agent
+#
+# Until these secrets exist, this workflow's job is skipped rather than
+# failing loudly — safe to merge before the droplet/repo are set up.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    if: >
+      ${{ (github.event_name == 'workflow_dispatch' ||
+           github.event.workflow_run.conclusion == 'success') &&
+          vars.DEPLOY_ENABLED != 'false' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check deploy secrets are configured
+        id: check
+        run: |
+          if [ -z "${{ secrets.DROPLET_HOST }}" ] || [ -z "${{ secrets.DROPLET_USER }}" ] || [ -z "${{ secrets.DROPLET_SSH_KEY }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DROPLET_HOST / DROPLET_USER / DROPLET_SSH_KEY not set yet — skipping deploy. See DEPLOYMENT.md."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy over SSH
+        if: steps.check.outputs.configured == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          port: ${{ secrets.DROPLET_SSH_PORT || 22 }}
+          script_stop: true
+          envs: DEPLOY_PATH
+          script: |
+            set -e
+            cd "${DEPLOY_PATH:-$HOME/ai-agent}"
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+            docker compose -f docker-compose.prod.yml up -d --build
+            docker image prune -f
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}

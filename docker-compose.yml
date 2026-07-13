@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: concierge-db
+    environment:
+      POSTGRES_USER: concierge
+      POSTGRES_PASSWORD: concierge
+      POSTGRES_DB: concierge
+    ports:
+      - "5432:5432"
+    volumes:
+      - concierge_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U concierge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  concierge_pgdata:

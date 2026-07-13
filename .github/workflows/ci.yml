@@ -1,0 +1,81 @@
+name: CI
+
+# There is no automated test suite in this project yet (course-project scope
+# choice — see CLAUDE.md). This workflow is the correctness safety net until
+# one exists: it makes sure the backend still imports, the frontend still
+# builds, and both Docker images still build, on every push/PR.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Byte-compile (catches syntax errors)
+        # evaluation/ is gitignored (not pushed to GitHub — see .gitignore),
+        # so only the shipped `app` package is checked here.
+        run: python -m compileall -q app
+
+      - name: Import smoke test
+        # No live DB/LLM key needed to import — Settings() falls back to
+        # defaults and SQLAlchemy's create_engine() doesn't connect until
+        # first use. This just proves the app wires together.
+        run: python -c "import app.main"
+
+  frontend-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+        run: npm run build
+
+  docker-build-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }} image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: false
+          tags: concierge-${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

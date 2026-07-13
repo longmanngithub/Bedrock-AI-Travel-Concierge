@@ -1,0 +1,10 @@
+node_modules/
+.next/
+out/
+dist/
+.env
+.env.*
+!.env.example
+.turbo/
+npm-debug.log*
+.DS_Store

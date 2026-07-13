@@ -1,0 +1,213 @@
+@import "tailwindcss";
+
+/* Class-based dark mode: `dark:` utilities apply when a .dark ancestor exists. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Design tokens. Values here are the LIGHT theme (the screenshot's look); the
+   .dark block below overrides the same CSS variables, so every `bg-canvas`,
+   `text-ink`, `bg-brand/10`, etc. flips automatically with the theme. */
+@theme {
+  --color-canvas: #f3fbfa;
+  --color-surface: #ffffff;
+  --color-surface-2: #edf9f7;
+  --color-ink: #0e2226;
+  --color-ink-soft: #435558;
+  --color-muted: #7c9295;
+  --color-line: #e0eeed;
+  --color-brand: #0d9488;
+  --color-brand-strong: #0f766e;
+  --color-brand-soft: #e3f8f4;
+  --color-on-brand: #ffffff;
+  --color-ok: #16a34a;
+  --color-warn: #e0912f;
+  --color-danger: #e5484d;
+
+  --radius-panel: 1.75rem;
+
+  --animate-msg-in: msg-in 260ms cubic-bezier(0.22, 1, 0.36, 1);
+  --animate-pulse-dot: pulse-dot 1.2s ease-in-out infinite;
+  --animate-caret: caret 1s step-end infinite;
+  --animate-fade-in: fade-in 200ms ease-out;
+}
+
+.dark {
+  --color-canvas: #071514;
+  --color-surface: #0e201f;
+  --color-surface-2: #132a29;
+  --color-ink: #e3f6f3;
+  --color-ink-soft: #b7d6d2;
+  --color-muted: #7fa19d;
+  --color-line: #1c3634;
+  --color-brand: #2dd4bf;
+  --color-brand-strong: #14b8a6;
+  --color-brand-soft: #113330;
+  --color-on-brand: #ffffff;
+  --color-ok: #22c55e;
+  --color-warn: #fbbf24;
+  --color-danger: #f0575c;
+}
+
+@keyframes msg-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+@keyframes caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Blinking caret appended to the assistant reply while it is still streaming. */
+.stream-caret::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--color-brand);
+  animation: var(--animate-caret);
+}
+
+/* Skeleton shimmer — a sweeping highlight over the placeholder blocks. */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--color-muted) 14%, transparent);
+}
+.shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--color-surface) 55%, transparent),
+    transparent
+  );
+  animation: shimmer 1.5s infinite;
+}
+
+/* Boarding-pass perforation: a dashed tear line with a punched notch cut into
+   each edge, so the ticket reads as a real stub-and-body pass. */
+.ticket-notch {
+  position: relative;
+  border-top: 2px dashed var(--color-line);
+}
+.ticket-notch::before,
+.ticket-notch::after {
+  content: "";
+  position: absolute;
+  top: -13px;
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
+  background: var(--color-surface-2);
+}
+.ticket-notch::before {
+  left: -13px;
+}
+.ticket-notch::after {
+  right: -13px;
+}
+
+/* Thin, theme-aware scrollbars for the sidebar and message list. */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-muted) 40%, transparent) transparent;
+}
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-muted) 35%, transparent);
+  border-radius: 9999px;
+}
+.thin-scroll::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-muted) 55%, transparent);
+}
+
+/* Eased color cross-fade for the light/dark toggle. Scoped to a temporary
+   class (added/removed by ThemeToggle around the moment of the flip) rather
+   than a permanent global transition, which would fight every other
+   purpose-built hover/focus transition already in the app. */
+.theme-transition,
+.theme-transition * {
+  transition:
+    background-color 300ms ease,
+    border-color 300ms ease,
+    color 300ms ease,
+    fill 300ms ease,
+    stroke 300ms ease,
+    box-shadow 300ms ease !important;
+}
+
+/* Respect the OS-level motion preference: keep functional feedback (focus,
+   disabled state) but drop decorative movement and cross-fades to a near-
+   instant duration instead of removing transitions outright. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

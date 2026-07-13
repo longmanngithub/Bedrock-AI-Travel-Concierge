@@ -1,0 +1,82 @@
+# Production stack for a DigitalOcean droplet (or any single-host Docker
+# deployment). Local dev keeps using docker-compose.yml (Postgres only) with
+# `uvicorn --reload` / `npm run dev` — this file containerizes everything.
+#
+# Usage (from the repo root, after copying .env.example -> .env and filling
+# in real values — see DEPLOYMENT.md):
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Docker Compose automatically loads a `.env` file from the current directory
+# for the ${VAR} substitutions below.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: concierge-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-concierge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-concierge}
+    volumes:
+      - concierge_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-concierge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - concierge_net
+    # No published port: only the backend container needs to reach Postgres.
+    # Uncomment to debug with a local psql client against the droplet:
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: concierge-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MODEL: ${MODEL:-gemini/gemini-3.1-flash-lite}
+      JUDGE_MODEL: ${JUDGE_MODEL:-gemini/gemini-3.1-flash-lite}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:?set GOOGLE_API_KEY in .env}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-concierge}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-concierge}
+      API_KEY: ${API_KEY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      RATE_LIMIT_GENERATE: ${RATE_LIMIT_GENERATE:-20/minute}
+    ports:
+      - "8000:8000"
+    networks:
+      - concierge_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client bundle at build time — must be the
+        # public-facing URL the browser will call (droplet IP or domain),
+        # not the internal "backend" service name.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL in .env}
+        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
+    container_name: concierge-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    networks:
+      - concierge_net
+
+networks:
+  concierge_net:
+    driver: bridge
+
+volumes:
+  concierge_pgdata:
