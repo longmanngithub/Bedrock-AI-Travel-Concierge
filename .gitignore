@@ -28,6 +28,10 @@ frontend/npm-debug.log*
 *.pid
 docker-compose.override.yml
 
+# GCP service-account key (Vertex AI auth for production deploy)
+gcp-key.json
+*.gcp-key.json
+
 # Editors / OS
 .DS_Store
 .idea/
