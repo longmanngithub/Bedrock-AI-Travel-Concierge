@@ -227,55 +227,89 @@ export const geo = {
 };
 
 // Subscribe to a job's resumable progress stream. Returns an unsubscribe fn.
+//
+// EventSource auto-reconnects on its own for a network-level drop, but NOT
+// for a reconnect attempt that gets back an explicit HTTP error status —
+// that's treated as fatal (readyState -> CLOSED) with no further retry, and
+// it has no hook to silently refresh and retry the way apiFetch does for a
+// normal request. A generation run is exactly when this bites: it can run
+// long enough for the access token to actually expire (especially if the tab
+// was backgrounded and the proactive refresh timer got throttled), and if the
+// connection happens to drop at that moment — a proxy hop resetting a
+// multi-minute connection, a brief network blip — the reconnect 401s and the
+// live view dies even though the job keeps running server-side. Before this,
+// that surfaced as a dead progress checklist or a forced logout for something
+// that was never actually a lost session. Try a silent refresh and reopen a
+// fresh connection first; the backend already handles a from-scratch
+// reconnect by sending the current snapshot (see routers/jobs.py), so no
+// progress is lost, just replayed from "now" instead of every prior step.
+const _MAX_JOB_AUTH_RECONNECTS = 3;
+
 export function subscribeJob(jobId, { onSnapshot, onStep, onActivity, onDone, onError } = {}) {
-  const es = new EventSource(`${BASE_URL}/jobs/${jobId}/events`, { withCredentials: true });
   let settled = false;
-  es.onmessage = (ev) => {
-    let frame;
-    try {
-      frame = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    switch (frame.kind) {
-      case "snapshot":
-        onSnapshot?.(frame);
-        break;
-      case "step":
-        onStep?.(frame);
-        break;
-      case "activity":
-        onActivity?.(frame);
-        break;
-      case "done":
-        settled = true;
-        es.close();
-        onDone?.(frame);
-        break;
-      case "cancelled":
-        settled = true;
-        es.close();
-        onError?.({ code: "E_JOB_CANCELLED", message: "This plan was cancelled." });
-        break;
-      case "error":
-        settled = true;
-        es.close();
-        onError?.(frame);
-        break;
-      default:
-        break;
-    }
-  };
-  es.onerror = () => {
-    // EventSource auto-reconnects with Last-Event-ID; only surface an error if
-    // the connection is permanently closed and the job never settled.
-    if (es.readyState === EventSource.CLOSED && !settled) {
-      onError?.({ code: "E_INTERNAL", message: "The connection was interrupted. Reconnecting…" });
-    }
-  };
+  let es = null;
+  let authReconnects = 0;
+
+  function connect() {
+    es = new EventSource(`${BASE_URL}/jobs/${jobId}/events`, { withCredentials: true });
+    es.onmessage = (ev) => {
+      let frame;
+      try {
+        frame = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      switch (frame.kind) {
+        case "snapshot":
+          onSnapshot?.(frame);
+          break;
+        case "step":
+          onStep?.(frame);
+          break;
+        case "activity":
+          onActivity?.(frame);
+          break;
+        case "done":
+          settled = true;
+          es.close();
+          onDone?.(frame);
+          break;
+        case "cancelled":
+          settled = true;
+          es.close();
+          onError?.({ code: "E_JOB_CANCELLED", message: "This plan was cancelled." });
+          break;
+        case "error":
+          settled = true;
+          es.close();
+          onError?.(frame);
+          break;
+        default:
+          break;
+      }
+    };
+    es.onerror = () => {
+      if (settled || es.readyState !== EventSource.CLOSED) return;
+      if (authReconnects >= _MAX_JOB_AUTH_RECONNECTS) {
+        onError?.({ code: "E_INTERNAL", message: "The connection was interrupted. Reconnecting…" });
+        return;
+      }
+      authReconnects += 1;
+      auth
+        .silentRefresh()
+        .then(() => {
+          if (!settled) connect();
+        })
+        .catch(() => {
+          if (!settled) onError?.({ code: "E_INTERNAL", message: "The connection was interrupted. Reconnecting…" });
+        });
+    };
+  }
+
+  connect();
   return () => {
     settled = true;
-    es.close();
+    es?.close();
   };
 }
 
