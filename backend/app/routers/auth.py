@@ -14,7 +14,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..auth import google
-from ..auth.cookies import REFRESH_COOKIE, clear_auth_cookies, set_auth_cookies, verify_csrf
+from ..auth.cookies import (
+    REFRESH_COOKIE,
+    clear_auth_cookies,
+    refresh_cookie_candidates,
+    set_auth_cookies,
+    verify_csrf,
+)
 from ..auth.deps import current_user, optional_user
 from ..auth.passwords import (
     hash_password,
@@ -23,7 +29,12 @@ from ..auth.passwords import (
     verify_password,
     verify_password_or_dummy,
 )
-from ..auth.tokens import revoke_all_for_user, rotate_refresh_token, start_session
+from ..auth.tokens import (
+    pick_live_refresh_token,
+    revoke_all_for_user,
+    rotate_refresh_token,
+    start_session,
+)
 from ..auth.verification import discard_registration_code, issue_registration_code, verify_registration_code
 from ..config import get_settings
 from ..database import get_db
@@ -238,7 +249,9 @@ def change_password(
 
 @router.post("/refresh", response_model=UserView)
 def refresh(request: Request, response: Response, db: Session = Depends(get_db)) -> UserView:
-    raw = request.cookies.get(REFRESH_COOKIE)
+    # May legitimately be more than one during the legacy "/auth"-path cookie
+    # migration; pick the live one rather than letting header order decide.
+    raw = pick_live_refresh_token(db, refresh_cookie_candidates(request))
     if not raw:
         raise AppError(ErrorCode.E_AUTH_REQUIRED, log_detail="no refresh cookie")
     ua, ip = _client(request)
@@ -251,9 +264,13 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
 
 @router.post("/logout")
 def logout(request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
-    raw = request.cookies.get(REFRESH_COOKIE)
-    if raw:
-        from ..auth.tokens import _hash_token, revoke_family
+    from ..auth.tokens import _hash_token, revoke_family
+
+    # Revoke every family the presented cookies point at, not just whichever
+    # one header order happened to surface — during the legacy-path migration
+    # a stale duplicate would otherwise leave the live session alive after a
+    # logout the user explicitly asked for.
+    for raw in refresh_cookie_candidates(request):
         row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == _hash_token(raw)))
         if row is not None:
             revoke_family(db, row.family_id)

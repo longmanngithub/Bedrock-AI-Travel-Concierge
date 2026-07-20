@@ -117,6 +117,31 @@ def start_session(db: Session, user_id: uuid.UUID, *, ua: str | None, ip: str | 
 _REUSE_GRACE_SECONDS = 10
 
 
+def pick_live_refresh_token(db: Session, candidates: list[str]) -> str | None:
+    """Choose which of several presented refresh cookies to actually rotate.
+
+    More than one arrives only during the legacy "/auth"-path cookie migration
+    (see auth/cookies.py). Picking by header order would be a coin flip, and
+    guessing wrong means handing an already-rotated token to
+    rotate_refresh_token, which reads that as theft and revokes the whole
+    family — logging the user out for what is really our own stale cookie.
+    Prefer a candidate that is genuinely live; fall back to the first so a
+    truly-invalid token still produces normal auth-failure semantics rather
+    than being silently swallowed.
+    """
+    if not candidates:
+        return None
+    now = datetime.now(timezone.utc)
+    for raw in candidates:
+        row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == _hash_token(raw)))
+        if row is None or row.revoked_at is not None:
+            continue
+        expires_at = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
+        if expires_at >= now:
+            return raw
+    return candidates[0]
+
+
 def rotate_refresh_token(
     db: Session, raw_token: str, *, ua: str | None, ip: str | None
 ) -> tuple[str, str, User]:
@@ -130,8 +155,24 @@ def rotate_refresh_token(
     already_rotated = row.revoked_at is not None
     if already_rotated:
         revoked_at = row.revoked_at if row.revoked_at.tzinfo else row.revoked_at.replace(tzinfo=timezone.utc)
-        if (now - revoked_at).total_seconds() > _REUSE_GRACE_SECONDS:
-            # Reuse well after rotation -> the token leaked. Nuke the whole family.
+        within_grace = (now - revoked_at).total_seconds() <= _REUSE_GRACE_SECONDS
+        # Grace covers the benign rotation race ONLY, which by definition
+        # leaves a live successor in the family. A family killed by the theft
+        # response below has no live token left — without this check, the
+        # grace window would keep honouring the very tokens that revocation
+        # was meant to kill for a further 10 seconds, defeating it.
+        if within_grace:
+            live_successor = db.scalar(
+                select(RefreshToken).where(
+                    RefreshToken.family_id == row.family_id,
+                    RefreshToken.revoked_at.is_(None),
+                    RefreshToken.expires_at >= now,
+                ).limit(1)
+            )
+            within_grace = live_successor is not None
+        if not within_grace:
+            # Reuse well after rotation (or into a revoked family) -> the token
+            # leaked. Nuke the whole family.
             revoke_family(db, row.family_id)
             raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="refresh reuse detected outside grace window")
     expires_at = row.expires_at
