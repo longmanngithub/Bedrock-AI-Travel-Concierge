@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, EmailStr, Field
@@ -271,6 +271,17 @@ _VERIFIER_COOKIE = "ac_oauth_verifier"
 _INTENT_COOKIE = "ac_oauth_intent"
 
 
+def _oauth_cookie_path() -> str:
+    # Scope the state/PKCE cookies to whatever path the browser will actually
+    # request for the callback — derived from the configured redirect URI
+    # rather than hardcoded, since that path is "/auth/google" direct-to-backend
+    # locally but "/api/auth/google" behind a reverse proxy that strips an
+    # /api/ prefix (see DEPLOYMENT.md §7.3). A mismatch here means the browser
+    # silently never sends the cookies back on the callback request.
+    callback_path = urlparse(get_settings().google_oauth_redirect_uri).path
+    return callback_path.rsplit("/", 1)[0] or "/"
+
+
 @router.get("/google/start")
 def google_start(request: Request, intent: str = "login", db: Session = Depends(get_db)) -> RedirectResponse:
     if not google.is_configured():
@@ -282,7 +293,7 @@ def google_start(request: Request, intent: str = "login", db: Session = Depends(
     state = uuid.uuid4().hex
     verifier, challenge = google.make_pkce()
     redirect = RedirectResponse(google.authorization_url(state, challenge), status_code=302)
-    common = dict(httponly=True, secure=settings.cookies_secure, samesite="lax", max_age=600, path="/auth/google")
+    common = dict(httponly=True, secure=settings.cookies_secure, samesite="lax", max_age=600, path=_oauth_cookie_path())
     redirect.set_cookie(_STATE_COOKIE, state, **common)
     redirect.set_cookie(_VERIFIER_COOKIE, verifier, **common)
     redirect.set_cookie(_INTENT_COOKIE, intent, **common)
@@ -294,9 +305,10 @@ def google_callback(request: Request, db: Session = Depends(get_db)) -> Redirect
     settings = get_settings()
 
     def _clear(response: RedirectResponse) -> RedirectResponse:
-        response.delete_cookie(_STATE_COOKIE, path="/auth/google")
-        response.delete_cookie(_VERIFIER_COOKIE, path="/auth/google")
-        response.delete_cookie(_INTENT_COOKIE, path="/auth/google")
+        cookie_path = _oauth_cookie_path()
+        response.delete_cookie(_STATE_COOKIE, path=cookie_path)
+        response.delete_cookie(_VERIFIER_COOKIE, path=cookie_path)
+        response.delete_cookie(_INTENT_COOKIE, path=cookie_path)
         return response
 
     def _err(reason: str = "1", log_detail: str | None = None) -> RedirectResponse:
