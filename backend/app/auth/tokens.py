@@ -105,20 +105,35 @@ def start_session(db: Session, user_id: uuid.UUID, *, ua: str | None, ip: str | 
     return access, refresh
 
 
+# A client can legitimately fire two refreshes almost simultaneously — the
+# same page's background silent-refresh timer racing an on-demand refresh
+# triggered by a 401, or simply two open tabs sharing the same cookies. The
+# loser presents a token the winner already rotated a few milliseconds
+# earlier. Without tolerance for that, reuse detection punishes ordinary
+# multi-tab usage with a full logout (revoke_family) instead of catching an
+# actual leaked token, which would be reused much later, if ever. Treating
+# reuse within this window as benign — mint another valid pair in the same
+# family instead of nuking it — is the standard mitigation for this race.
+_REUSE_GRACE_SECONDS = 10
+
+
 def rotate_refresh_token(
     db: Session, raw_token: str, *, ua: str | None, ip: str | None
 ) -> tuple[str, str, User]:
-    """Rotate a refresh token. Raises E_SESSION_REVOKED on reuse/unknown token,
-    E_AUTH_EXPIRED on an expired one."""
+    """Rotate a refresh token. Raises E_SESSION_REVOKED on reuse outside the
+    grace window (or an unknown token), E_AUTH_EXPIRED on an expired one."""
     token_hash = _hash_token(raw_token)
     row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
     if row is None:
         raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="unknown refresh token")
-    if row.revoked_at is not None:
-        # Reuse of a revoked token -> the token leaked. Nuke the whole family.
-        revoke_family(db, row.family_id)
-        raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="refresh reuse detected")
     now = datetime.now(timezone.utc)
+    already_rotated = row.revoked_at is not None
+    if already_rotated:
+        revoked_at = row.revoked_at if row.revoked_at.tzinfo else row.revoked_at.replace(tzinfo=timezone.utc)
+        if (now - revoked_at).total_seconds() > _REUSE_GRACE_SECONDS:
+            # Reuse well after rotation -> the token leaked. Nuke the whole family.
+            revoke_family(db, row.family_id)
+            raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="refresh reuse detected outside grace window")
     expires_at = row.expires_at
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
@@ -129,8 +144,9 @@ def rotate_refresh_token(
     if user is None:
         raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="user gone")
 
-    # Revoke the presented token, mint a new one in the same family.
-    row.revoked_at = now
+    # Revoke the presented token (if not already), mint a new one in the same family.
+    if not already_rotated:
+        row.revoked_at = now
     db.commit()
     access = issue_access_token(user.id, row.family_id)
     refresh = issue_refresh_token(db, user.id, row.family_id, ua=ua, ip=ip)
