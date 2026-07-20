@@ -1,11 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Logo from "./Logo.jsx";
 import Skeleton from "./Skeleton.jsx";
-import ThemeToggle from "./ThemeToggle.jsx";
-import { ChatBubbleIcon, PlusIcon, SettingsIcon, TrashIcon } from "./icons.jsx";
-import { listConversations } from "../lib/conversations.js";
+import AuthControls from "./auth/AuthControls.jsx";
+import { ChatBubbleIcon, PlusIcon, TrashIcon } from "./icons.jsx";
 
 // Bucket a conversation by how recently it was touched, so the list reads like
 // the reference's "Your conversations / Last 7 Days" grouping.
@@ -72,7 +71,7 @@ function ConversationItem({ conversation, isActive, isGenerating, onSelect, onDe
         </span>
       </button>
 
-      <div className={`flex shrink-0 items-center gap-0.5 ${isActive ? "" : "opacity-0 group-hover/item:opacity-100"}`}>
+      <div className={`flex shrink-0 items-center gap-0.5 ${isActive ? "" : "opacity-100 md:opacity-0 md:group-hover/item:opacity-100"}`}>
         <button
           type="button"
           onClick={() => setConfirming(true)}
@@ -107,24 +106,40 @@ function SidebarSkeleton({ count = 3 }) {
 
 export default function Sidebar({
   activeId,
+  conversations,
   onSelectConversation,
   onNewChat,
   onDeleteConversation,
   onClearAll,
   onClose,
   mounted,
-  version,
   initialConversationCount,
   activeStreams,
 }) {
-  // `version` forces a re-read of localStorage-backed state on every mutation.
-  void version;
-  const conversations = mounted ? listConversations() : [];
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  // The footer floats absolutely over the conversation list (same treatment
+  // as the composer floating over the message list) so scrolled items dissolve
+  // behind a translucent, blurred panel instead of pushing the list up. Its
+  // height is measured live — not a fixed guess — because it changes with the
+  // account-linking notice banner and the auth menu's own content.
+  const footerRef = useRef(null);
+  const [footerHeight, setFooterHeight] = useState(96);
+
+  useEffect(() => {
+    const el = footerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      setFooterHeight(entries[0].contentRect.height);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const groups = useMemo(() => {
     const map = new Map();
     for (const c of conversations) {
-      const b = bucketOf(c.updatedAt);
+      const b = bucketOf(c.updated_at);
       if (!map.has(b)) map.set(b, []);
       map.get(b).push(c);
     }
@@ -136,22 +151,10 @@ export default function Sidebar({
     onClose?.();
   }
 
-  // Read conversation count from localStorage before mount
-  let initialCount = initialConversationCount ?? 3;
-  if (typeof window !== "undefined") {
-    try {
-      const raw = window.localStorage.getItem("bedrock:conversations");
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed.conversations)) {
-          initialCount = parsed.conversations.length;
-        }
-      }
-    } catch (e) {}
-  }
+  const initialCount = initialConversationCount ?? 3;
 
   return (
-    <aside className="flex h-full w-full flex-col bg-surface rounded-r-[28px] md:w-[300px] md:rounded-[28px] md:shadow-[0_2px_20px_rgba(30,30,60,0.06)]">
+    <aside className="relative flex h-full w-full flex-col bg-surface rounded-r-[28px] md:w-[300px] md:rounded-[28px] md:shadow-[0_2px_20px_rgba(30,30,60,0.06)]">
       {/* Brand */}
       <div className="flex items-center gap-2.5 px-5 pt-6 pb-5">
         <Logo size={30} />
@@ -179,18 +182,43 @@ export default function Sidebar({
       <div className="flex items-center justify-between px-6 pb-2">
         <span className="text-xs font-medium text-muted">Your conversations</span>
         {mounted && conversations.length > 0 && (
-          <button
-            type="button"
-            onClick={onClearAll}
-            className="text-xs font-medium text-brand transition-opacity hover:opacity-70"
-          >
-            Clear All
-          </button>
+          confirmClear ? (
+            // Destructive action gets the same inline confirm as single-chat
+            // delete — previously Clear All fired immediately with no guard.
+            <span className="flex items-center gap-2 text-xs">
+              <span className="text-muted">Clear all?</span>
+              <button
+                type="button"
+                onClick={() => { setConfirmClear(false); onClearAll(); }}
+                className="font-medium text-danger hover:opacity-70"
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClear(false)}
+                className="font-medium text-muted hover:opacity-70"
+              >
+                No
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setConfirmClear(true)}
+              className="text-xs font-medium text-brand transition-opacity hover:opacity-70"
+            >
+              Clear All
+            </button>
+          )
         )}
       </div>
 
       {/* List */}
-      <nav className="thin-scroll flex-1 overflow-y-auto px-1 pb-2">
+      <nav
+        className="thin-scroll flex-1 overflow-y-auto px-1"
+        style={{ paddingBottom: footerHeight + 8 }}
+      >
         {!mounted ? (
           <SidebarSkeleton count={initialCount} />
         ) : conversations.length === 0 ? (
@@ -219,12 +247,24 @@ export default function Sidebar({
         )}
       </nav>
 
-      {/* Footer */}
-      <div className="mt-auto border-t border-line px-3 py-3">
-        <div className="flex items-center gap-2 rounded-xl px-2.5 py-2 text-sm text-ink-soft">
-          <SettingsIcon className="h-4 w-4 text-muted" />
-          <span className="flex-1">Appearance</span>
-          <ThemeToggle />
+      {/* The profile control floats above the conversation scroller. A
+          transparent, masked backdrop blur preserves the hierarchy while
+          allowing the scrolled content to remain visible behind it. */}
+      <div ref={footerRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-10">
+        <div className="pointer-events-auto relative px-3 pb-3 pt-8">
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-28"
+            style={{
+              WebkitBackdropFilter: "blur(8px)",
+              backdropFilter: "blur(8px)",
+              WebkitMaskImage: "linear-gradient(to top, rgba(0,0,0,1) 45%, rgba(0,0,0,0) 100%)",
+              maskImage: "linear-gradient(to top, rgba(0,0,0,1) 45%, rgba(0,0,0,0) 100%)",
+            }}
+          />
+          <div className="relative">
+            <AuthControls />
+          </div>
         </div>
       </div>
     </aside>

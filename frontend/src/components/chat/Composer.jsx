@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { ArrowDownIcon, EditIcon, SendIcon } from "../icons.jsx";
+import { ArrowDownIcon, EditIcon, SendIcon, StopIcon } from "../icons.jsx";
 import QuickReplies from "./QuickReplies.jsx";
 
 // Controlled by the parent (value/onChange) rather than owning its own text
@@ -21,6 +21,7 @@ export default function Composer({
   onPickQuickReply,
   isAtBottom = true,
   onScrollToBottom,
+  onCancel,
 }) {
   const internalRef = useRef(null);
   const textareaRef = inputRef || internalRef;
@@ -99,7 +100,21 @@ export default function Composer({
         {isEditing && (
           <div className="mb-1.5 flex items-center gap-1.5 px-1 text-xs text-muted pointer-events-auto">
             <EditIcon className="h-3 w-3" />
-            <span>Editing message — press Esc to cancel</span>
+            <span className="flex-1">
+              Editing message<span className="hidden sm:inline"> — press Esc to cancel</span>
+            </span>
+            {/* Mobile has no Esc key — give an always-tappable cancel control. */}
+            <button
+              type="button"
+              onClick={() => onCancelEdit?.()}
+              aria-label="Cancel editing"
+              className="flex h-6 items-center gap-1 rounded-full px-2 font-medium text-brand transition hover:bg-surface-2"
+            >
+              <svg viewBox="0 0 20 20" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2.2">
+                <path d="M6 6l8 8M14 6l-8 8" strokeLinecap="round" />
+              </svg>
+              Cancel
+            </button>
           </div>
         )}
 
@@ -113,15 +128,30 @@ export default function Composer({
             placeholder="Tell me where you'd like to go…"
             className="max-h-44 flex-1 resize-none bg-transparent py-1.5 text-sm text-ink placeholder:text-muted focus:outline-none"
           />
-          <button
-            type="button"
-            onClick={submit}
-            disabled={disabled || !value.trim()}
-            aria-label="Send message"
-            className="mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-brand text-on-brand shadow-sm transition-all hover:bg-brand-strong active:scale-95 disabled:cursor-not-allowed disabled:opacity-35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
-          >
-            <SendIcon className="h-4.5 w-4.5" />
-          </button>
+          {disabled && onCancel ? (
+            // While a reply/plan is generating, the send button becomes a stop
+            // button — lets the user change their mind instead of waiting out
+            // a run that can take over a minute.
+            <button
+              type="button"
+              onClick={onCancel}
+              aria-label="Stop generating"
+              title="Stop generating"
+              className="mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-canvas shadow-sm transition-all hover:opacity-85 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            >
+              <StopIcon className="h-4 w-4" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={submit}
+              disabled={disabled || !value.trim()}
+              aria-label="Send message"
+              className="mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-brand text-on-brand shadow-sm transition-all hover:bg-brand-strong active:scale-95 disabled:cursor-not-allowed disabled:opacity-35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+            >
+              <SendIcon className="h-4.5 w-4.5" />
+            </button>
+          )}
         </div>
         <p className="pointer-events-none mt-2 text-center text-[11px] text-muted">
           Bedrock plans trips — it may take a moment to build a full itinerary.

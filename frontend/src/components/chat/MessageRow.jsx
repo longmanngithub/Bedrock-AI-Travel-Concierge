@@ -5,8 +5,7 @@ import Logo from "../Logo.jsx";
 import MarkdownText from "./MarkdownText.jsx";
 import TravelTicket from "./TravelTicket.jsx";
 import TypingIndicator from "./TypingIndicator.jsx";
-import TicketSkeleton from "./TicketSkeleton.jsx";
-import StagingIndicator from "./StagingIndicator.jsx";
+import ResearchProgress from "./ResearchProgress.jsx";
 import {
   CheckIcon,
   ChevronDownIcon,
@@ -58,7 +57,7 @@ function ActionBar({ message, disabled, onRegenerate, onFeedback, showRegenerate
 
   return (
     <div className="mt-2.5 flex items-center gap-1">
-      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+      <div className="flex items-center gap-0.5 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
         <IconButton
           label="Good response"
           active={message.feedback === "up"}
@@ -111,16 +110,16 @@ export default function MessageRow({
 }) {
   const isUser = message.role === "user";
   const isTicket = message.kind === "result" && message.itinerary;
-  // Only a genuine failure gets the warning treatment. A "refusal" is just a
-  // friendly off-topic redirect, so it renders as ordinary assistant text.
-  const isNotice = message.kind === "error";
+  const isStopped = message.kind === "stopped";
+  // Only a genuine failure gets the warning treatment. A stopped response is
+  // an informational acknowledgement, not something the user must retry.
+  const isNotice = message.kind === "error" || isStopped;
   const hasText = Boolean((message.content || "").trim());
 
-  // While an assistant turn is streaming we may not know its type yet: before
-  // the first token (and before meta) show typing dots; once it's a `result`
-  // and the itinerary hasn't landed, show the boarding-pass skeleton.
-  const showTypingDots = streaming && !hasText;
-  const showTicketSkeleton = streaming && stagingType === "result" && !isTicket;
+  const isResearchCompleting = stagingType === "research-completing";
+  const showResearch = streaming && (stagingType === "research" || isResearchCompleting) && !isTicket;
+  const showTypingDots = streaming && !hasText && !showResearch;
+  const liveProgress = showResearch ? (message.progress || { steps: [], percent: 0, activity: null }) : null;
 
   return (
     <div className="group w-full px-4 py-4 sm:px-6">
@@ -135,7 +134,7 @@ export default function MessageRow({
               onClick={() => onEditMessage(message.id)}
               aria-label="Edit message"
               title="Edit message"
-              className="mb-1 flex h-6 w-6 items-center justify-center rounded-md text-muted opacity-0 transition-opacity hover:bg-surface-2 hover:text-ink group-hover:opacity-100 disabled:opacity-0"
+              className="mb-1 flex h-6 w-6 items-center justify-center rounded-md text-muted opacity-100 transition-opacity hover:bg-surface-2 hover:text-ink md:opacity-0 md:group-hover:opacity-100 disabled:opacity-0"
             >
               <EditIcon className="h-3.5 w-3.5" />
             </button>
@@ -151,9 +150,22 @@ export default function MessageRow({
             </div>
 
             {isNotice ? (
-              <div className="flex items-start gap-2.5 rounded-2xl border border-warn/25 bg-warn/5 px-4 py-3">
-                <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-warn" />
-                <p className="text-[0.95rem] leading-relaxed text-ink">{message.content}</p>
+              <div className={`flex items-start gap-2.5 rounded-2xl border px-4 py-3 ${isStopped ? "border-line bg-surface-2/60" : "border-warn/25 bg-warn/5"}`}>
+                <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${isStopped ? "bg-muted" : "bg-warn"}`} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[0.95rem] leading-relaxed text-ink">{message.content}</p>
+                  {isLast && !isStopped && (
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => onRegenerate(message.id)}
+                      className="mt-2 flex items-center gap-1.5 rounded-full border border-line px-3 py-1.5 text-xs font-medium text-ink-soft transition-colors hover:border-brand hover:text-brand disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <RegenerateIcon className="h-3.5 w-3.5" />
+                      Try again
+                    </button>
+                  )}
+                </div>
               </div>
             ) : (
               <>
@@ -165,19 +177,38 @@ export default function MessageRow({
                   hasText && <MarkdownText text={message.content} streaming={streaming} />
                 )}
 
-                {showTicketSkeleton && (
-                  <div className="mt-3 space-y-3">
-                    <StagingIndicator startedAt={startedAt} />
-                    <TicketSkeleton />
+                {(liveProgress || (isResearchCompleting && message.completionTicket)) && (
+                  <div className={`mt-3 ${isResearchCompleting ? "ticket-handoff" : ""}`}>
+                    {liveProgress && (
+                      <div className={isResearchCompleting ? "ticket-handoff-checklist" : ""}>
+                        <ResearchProgress
+                          steps={liveProgress.steps}
+                          percent={liveProgress.percent}
+                          activity={liveProgress.activity}
+                          startedAt={startedAt}
+                        />
+                      </div>
+                    )}
+                    {isResearchCompleting && message.completionTicket && (
+                      <div className="ticket-handoff-ticket">
+                        <TravelTicket
+                          itinerary={message.completionTicket.itinerary}
+                          tripRequest={message.completionTicket.tripRequest}
+                          elapsedSeconds={message.completionTicket.elapsedSeconds}
+                          recordId={message.completionTicket.recordId}
+                        />
+                      </div>
+                    )}
                   </div>
                 )}
 
                 {isTicket && (
-                  <div className="mt-3">
+                  <div className={`mt-3 ${message.skipTicketEntrance ? "ticket-handoff-settled" : ""}`}>
                     <TravelTicket
                       itinerary={message.itinerary}
                       tripRequest={message.tripRequest}
                       elapsedSeconds={message.elapsedSeconds}
+                      recordId={message.recordId}
                     />
                   </div>
                 )}

@@ -1,4 +1,9 @@
+"use client";
+
+import { useEffect, useState } from "react";
 import { PlaneIcon } from "../icons.jsx";
+import { itineraries, formatError } from "../../lib/api.js";
+import { useAuth } from "../../lib/AuthContext.jsx";
 
 // ---- small deterministic helpers (stable across re-renders, no Date.now) ----
 function airportCode(name) {
@@ -85,6 +90,147 @@ function Section({ icon, label, children }) {
   );
 }
 
+// Every source URL originates from a web search result or a third-party API
+// response — untrusted content, same as any other tool output (see tools.py's
+// injection-defense comments). Only ever render it as a link after confirming
+// it parses as https, and always with rel="noopener noreferrer" so the linked
+// page can't reach back into this tab via window.opener.
+function SourceLink({ source }) {
+  let safeUrl = null;
+  try {
+    const parsed = new URL(source.url);
+    if (parsed.protocol === "https:") safeUrl = parsed.href;
+  } catch {
+    /* not a valid absolute URL — render as plain text below */
+  }
+  const label = source.title || source.publisher || source.url;
+  return (
+    <li className="flex items-baseline gap-2">
+      <span className="text-muted">[{source.id}]</span>
+      {safeUrl ? (
+        <a
+          href={safeUrl}
+          target="_blank"
+          rel="noopener noreferrer nofollow"
+          className="min-w-0 truncate text-brand hover:underline"
+        >
+          {label}
+        </a>
+      ) : (
+        <span className="min-w-0 truncate text-ink-soft">{label}</span>
+      )}
+      {source.publisher && <span className="shrink-0 text-xs text-muted">· {source.publisher}</span>}
+    </li>
+  );
+}
+
+// Fires POST /itineraries/{id}/deliver, then polls the lightweight status
+// endpoint a few times — delivery is a single deterministic backend call
+// (PDF render + one HTTP send), not a whole job/SSE-tracked run, so a short
+// poll is simpler than subscribing to anything.
+function useDelivery(recordId, channel) {
+  const [state, setState] = useState("idle"); // idle | sending | sent | failed
+  const [error, setError] = useState("");
+
+  // Hydrate from the backend's record on mount — without this, reloading the
+  // page after a send always shows the same idle "Email me this PDF" button,
+  // even though `deliveries` on the trip record already has a sent/failed
+  // outcome. Only ever reads; `send()` below is what mutates state.
+  useEffect(() => {
+    if (!recordId) return;
+    let cancelled = false;
+    itineraries
+      .deliveryStatus(recordId)
+      .then((statuses) => {
+        if (cancelled) return;
+        const outcome = statuses[channel];
+        if (outcome?.status === "sent") setState("sent");
+        else if (outcome?.status === "failed") {
+          setState("failed");
+          setError("Delivery failed. Please try again.");
+        }
+      })
+      .catch(() => {
+        /* best-effort — leave it idle rather than blocking on a fetch error */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [recordId, channel]);
+
+  async function send() {
+    if (!recordId || state === "sending") return;
+    setState("sending");
+    setError("");
+    try {
+      await itineraries.deliver(recordId, channel);
+    } catch (err) {
+      setState("failed");
+      setError(formatError(err));
+      return;
+    }
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const statuses = await itineraries.deliveryStatus(recordId);
+        const outcome = statuses[channel];
+        if (outcome?.status === "sent") {
+          setState("sent");
+          return;
+        }
+        if (outcome?.status === "failed") {
+          setState("failed");
+          setError("Delivery failed. Please try again.");
+          return;
+        }
+      } catch {
+        /* keep polling — a transient fetch error shouldn't abandon the poll */
+      }
+    }
+    // No terminal status within the poll window — not necessarily failed
+    // (the worker may just be slow), so don't claim success or failure.
+    setState("idle");
+  }
+
+  return { state, error, send };
+}
+
+function DeliveryButton({ recordId, channel, label, disabledReason }) {
+  const { state, error, send } = useDelivery(recordId, channel);
+  const disabled = Boolean(disabledReason) || state === "sending" || state === "sent";
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <button
+        type="button"
+        onClick={send}
+        disabled={disabled}
+        title={disabledReason || undefined}
+        className="flex items-center gap-1.5 rounded-full border border-line px-3 py-1.5 text-xs font-medium text-ink-soft transition-colors hover:border-brand hover:text-brand disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {state === "sent" ? "Sent ✓" : state === "sending" ? "Sending…" : label}
+      </button>
+      {state === "failed" && <p className="text-[11px] text-danger">{error}</p>}
+      {disabledReason && state === "idle" && <p className="text-[11px] text-muted">{disabledReason}</p>}
+    </div>
+  );
+}
+
+function DeliveryActions({ recordId }) {
+  const { user } = useAuth();
+  if (!recordId) return null;
+  return (
+    <div className="flex flex-wrap gap-3 border-t border-line px-5 py-4">
+      <DeliveryButton recordId={recordId} channel="email" label="Email me this PDF" />
+      <DeliveryButton
+        recordId={recordId}
+        channel="telegram"
+        label="Send to Telegram"
+        disabledReason={user && !user.telegram_linked ? "Connect Telegram in Settings first" : undefined}
+      />
+    </div>
+  );
+}
+
 function BudgetRow({ label, value, strong }) {
   return (
     <div
@@ -101,7 +247,7 @@ function BudgetRow({ label, value, strong }) {
 // The personalized "boarding pass" presentation of a generated itinerary: an
 // airline-style pass header (route, flight info, stub + barcode), then the full
 // day-by-day itinerary body beneath it.
-export default function TravelTicket({ itinerary, tripRequest, elapsedSeconds }) {
+export default function TravelTicket({ itinerary, tripRequest, elapsedSeconds, recordId }) {
   if (!itinerary) return null;
   const budget = itinerary.budget || {};
   const currency = budget.currency || tripRequest?.currency || "USD";
@@ -352,7 +498,19 @@ export default function TravelTicket({ itinerary, tripRequest, elapsedSeconds })
             </p>
           </Section>
         )}
+
+        {itinerary.sources?.length > 0 && (
+          <Section label="Sources">
+            <ul className="space-y-1.5 text-sm">
+              {itinerary.sources.map((s) => (
+                <SourceLink key={s.id} source={s} />
+              ))}
+            </ul>
+          </Section>
+        )}
       </div>
+
+      <DeliveryActions recordId={recordId} />
 
       <div className="border-t border-line px-5 py-3 text-xs text-muted">
         <p>

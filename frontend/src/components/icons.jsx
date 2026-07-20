@@ -97,6 +97,14 @@ export function MoreIcon({ className = "h-4 w-4" }) {
   );
 }
 
+export function StopIcon({ className = "h-4 w-4" }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="currentColor" aria-hidden="true">
+      <rect x="6" y="6" width="12" height="12" rx="3" />
+    </svg>
+  );
+}
+
 export function SendIcon({ className = "h-4 w-4" }) {
   return (
     <svg viewBox="0 0 24 24" className={className} {...base} aria-hidden="true">
@@ -142,6 +150,25 @@ export function MoonIcon({ className = "h-4 w-4" }) {
   return (
     <svg viewBox="0 0 24 24" className={className} {...base} aria-hidden="true">
       <path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5Z" />
+    </svg>
+  );
+}
+
+export function EyeIcon({ className = "h-4 w-4" }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} {...base} aria-hidden="true">
+      <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
+      <circle cx="12" cy="12" r="2.7" />
+    </svg>
+  );
+}
+
+export function EyeOffIcon({ className = "h-4 w-4" }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} {...base} aria-hidden="true">
+      <path d="M3 3l18 18" />
+      <path d="M10.6 5.7A10.4 10.4 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a15.8 15.8 0 0 1-3.2 4M6.3 6.9C3.9 8.6 2.5 12 2.5 12S6 18.5 12 18.5a9.9 9.9 0 0 0 3.2-.55" />
+      <path d="M9.9 9.9a2.7 2.7 0 0 0 3.8 3.8" />
     </svg>
   );
 }

@@ -1,9 +1,28 @@
 import "./globals.css";
 
+const TITLE = "Bedrock · AI Travel Concierge";
+const DESCRIPTION =
+  "Plan your next trip with Bedrock — a friendly AI travel concierge that builds you a full, personalized itinerary.";
+
 export const metadata = {
-  title: "Bedrock · AI Travel Concierge",
-  description:
-    "Plan your next trip with Bedrock — a friendly AI travel concierge that builds you a full, personalized itinerary.",
+  title: TITLE,
+  description: DESCRIPTION,
+  // The whole app sits behind auth (see AuthContext.jsx) with no separate
+  // public marketing surface to index — noindex here rather than let a
+  // crawler land on a login wall. robots.ts carries the same directive for
+  // crawlers that fetch robots.txt before rendering the page.
+  robots: { index: false, follow: false },
+  openGraph: {
+    title: TITLE,
+    description: DESCRIPTION,
+    type: "website",
+    siteName: "Bedrock",
+  },
+  twitter: {
+    card: "summary",
+    title: TITLE,
+    description: DESCRIPTION,
+  },
 };
 
 export const viewport = {

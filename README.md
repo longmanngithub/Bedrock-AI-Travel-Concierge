@@ -24,16 +24,22 @@ Next.js chat ──> FastAPI /chat/stream (SSE) ──> intent + slot extraction
    │                                              │  │               question + suggestion chips
    │                                              │  └─ ready?     → TravelCrew (below)
    │
-   └────────────────────────────> TravelCrew (CrewAI, sequential)
+   └────────────────────────────> enqueued as a background job (Redis/arq) ──> TravelCrew
                                           Destination → Food → Personalization →
                                           Accommodation → Budget → Planner → Reviewer
-                                            │ tools: web search (LangChain),
-                                            │ RAG retriever (Chroma),
-                                            │ budget calc (code)
-                                          structured Itinerary
+                                            │ tools: Tavily web search, Google Places
+                                            │ lookup, Travelpayouts flight price lookup,
+                                            │ RAG retriever (Chroma), budget calc (code)
+                                          structured Itinerary (+ source citations)
                                           → PostgreSQL + boarding-pass card
+                                          → optional: PDF email / Telegram delivery
 Evaluation harness ──> runs each scenario through baseline AND crew, scores both.
 ```
+
+The crew runs in a background worker process, not inline in the HTTP request
+— see "Background worker" in Setup below. This is what lets a plannable turn
+survive closing the browser tab mid-run; the client reconnects to a resumable
+SSE stream for live per-agent progress.
 
 | Layer       | Tech                                                         |
 | ----------- | ------------------------------------------------------------ |
@@ -59,6 +65,34 @@ Evaluation harness ──> runs each scenario through baseline AND crew, scores 
 
 ---
 
+## Beyond the core crew
+
+The evaluation harness (below) is the academic core, but the app itself has
+grown past that into a small product:
+
+- **Accounts** — email+password or Google OAuth; chat requires a signed-in
+  account. Conversations, generations, and delivery preferences are scoped
+  to the owner.
+- **Grounded citations** — search/places/flight-price results are attached
+  to the itinerary as real, clickable sources rather than asserted as prose;
+  see `Itinerary.sources`.
+- **PDF delivery** — a finished (or replanned) itinerary is automatically
+  rendered as a boarding-pass PDF and sent to a verified email
+  (Resend) and/or a linked Telegram chat, if the account opted in — a manual
+  "email me this PDF" button exists too. Neither is required to use the app.
+- **Agent memory (opt-in, off by default)** — recurring preferences from a
+  traveller's own past trips (pace, cuisine, budget tier) can be remembered
+  and injected into future plans; toggle and "delete my memory" both live in
+  Settings.
+- **Location-aware flight pricing (opt-in)** — sharing browser geolocation
+  lets the Destination agent look up real flight prices from where the
+  traveller actually is, instead of guessing an origin.
+
+None of the above is required to run the evaluation harness, which calls the
+crew/baseline directly and has no account or Redis dependency.
+
+---
+
 ## Prerequisites
 
 - **Python 3.11 or 3.12** (recommended). Avoid 3.14 for now — CrewAI, ChromaDB
@@ -77,13 +111,16 @@ Evaluation harness ──> runs each scenario through baseline AND crew, scores 
 
 ## Setup
 
-### 1. Database
+### 1. Database + Redis
 
 ```bash
-docker compose up -d db          # starts PostgreSQL on :5432
+docker compose up -d db redis    # PostgreSQL on :5432, Redis on :6379
 ```
 
-### 2. Backend
+Redis backs the background job queue (below) — the crew no longer runs inline
+inside the HTTP request, so this step is required, not optional.
+
+### 2. Backend API
 
 ```bash
 cd backend
@@ -92,6 +129,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 cp .env.example .env             # then paste your GOOGLE_API_KEY into .env
+alembic upgrade head              # apply migrations
 
 python -m app.rag.ingest         # build the RAG vector store (first run downloads
                                  # a small embeddings model, ~90 MB)
@@ -99,7 +137,23 @@ python -m app.rag.ingest         # build the RAG vector store (first run downloa
 uvicorn app.main:app --reload    # API on http://localhost:8000  (docs at /docs)
 ```
 
-### 3. Frontend
+### 3. Background worker
+
+**Required** — a plannable turn only *enqueues* a job; nothing ever runs it
+without this process. It's a separate long-lived process, not something
+`uvicorn` starts for you:
+
+```bash
+cd backend
+source .venv/bin/activate
+arq app.queue.worker.WorkerSettings
+```
+
+Jobs enqueued while no worker is running aren't lost — they sit in Redis and
+get picked up as soon as one starts — but nothing will visibly happen (the UI
+will sit at "Researching your trip…" indefinitely) until this is running.
+
+### 4. Frontend
 
 ```bash
 cd frontend
@@ -108,12 +162,17 @@ npm install
 npm run dev                      # Next.js UI on http://localhost:5173
 ```
 
-Open http://localhost:5173 and just chat: tell Bedrock where you'd like to go.
-It streams a reply, asks for anything missing (with tappable suggestion chips
-and a free-text "Something else" option), then — once it has a destination,
-dates, and a budget — runs the **CrewAI multi-agent** crew and returns the
-itinerary as a boarding-pass card. (The single-LLM baseline still lives behind
-`POST /itineraries?system=baseline` and the evaluation harness below.)
+Open http://localhost:5173. **An account is required to chat at all** — the
+first thing you'll see is a sign-in/register prompt (email+password, or
+Google if `GOOGLE_OAUTH_CLIENT_ID`/`GOOGLE_OAUTH_CLIENT_SECRET` are set in
+`backend/.env`; see that file's comments for the Google Cloud Console setup).
+Once signed in, tell Bedrock where you'd like to go — it streams a reply,
+asks for anything missing (with tappable suggestion chips), then — once it
+has a destination, dates, and a budget — enqueues the **CrewAI multi-agent**
+crew and shows live per-agent progress until the itinerary comes back as a
+boarding-pass card. (The single-LLM baseline still lives behind
+`POST /itineraries?system=baseline` and the evaluation harness below, and
+runs inline since it's a single LLM call, not a background job.)
 
 ---
 
@@ -189,11 +248,16 @@ throttle-bound.) Both are one-line `.env` swaps.
 ## Repository layout
 
 ```
-backend/app/          config, schemas, LLM factory, FastAPI app, DB models
-backend/app/crew/     agents, tasks, tools, crew assembly
-backend/app/rag/      curated knowledge base + Chroma ingest
-backend/evaluation/   scenarios, metrics, run_eval, reviewer_probe
-frontend/             Next.js (App Router) streaming chat UI
+backend/app/            config, schemas, LLM factory, FastAPI app, DB models
+backend/app/crew/       agents, tasks, tools, crew assembly, source citations
+backend/app/rag/        curated knowledge base + Chroma ingest
+backend/app/auth/       accounts, sessions, Google OAuth
+backend/app/queue/      arq background jobs (the crew runs here, not in the request)
+backend/app/delivery/   PDF rendering, email (Resend), Telegram
+backend/app/routers/    auth/conversations/jobs/settings/geo route modules
+backend/alembic/        DB migrations
+backend/evaluation/     scenarios, metrics, run_eval, reviewer_probe
+frontend/               Next.js (App Router) streaming chat UI
 ```
 
 ## Troubleshooting

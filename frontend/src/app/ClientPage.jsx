@@ -3,22 +3,24 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import Sidebar from "../components/Sidebar.jsx";
 import ChatWindow from "../components/chat/ChatWindow.jsx";
-import ThemeToggle from "../components/ThemeToggle.jsx";
 import Logo from "../components/Logo.jsx";
 import { MenuIcon } from "../components/icons.jsx";
-import {
-  clearAllConversations,
-  createConversation,
-  deleteConversation,
-  getActiveId,
-  setActiveId as persistActiveId,
-  getConversation,
-} from "../lib/conversations.js";
+import { AuthProvider } from "../lib/AuthContext.jsx";
+import { ConversationsProvider, useConversations } from "../lib/ConversationsContext.jsx";
+import { jobs as jobsApi, subscribeJob } from "../lib/api.js";
 
-export default function ClientPage({ initialHasConversations, initialConversationCount, initialActiveStructure }) {
-  const [activeId, setActiveId] = useState(null);
-  const [version, setVersion] = useState(0);
-  const [mounted, setMounted] = useState(false);
+function ClientPageInner({ initialHasConversations, initialConversationCount, initialActiveStructure }) {
+  const {
+    conversations: convList,
+    loadingList,
+    activeId,
+    selectConversation,
+    startNewChat,
+    deleteConversation,
+    clearAll,
+    refreshList,
+    loadMessages,
+  } = useConversations();
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   // Background stream states mapped by conversation ID
@@ -64,77 +66,168 @@ export default function ClientPage({ initialHasConversations, initialConversatio
     };
   }, []);
 
-  // sessionStorage tracks the tab session. If this is the first load in a new tab/session,
-  // we start the user on the Welcome screen (activeId = null) regardless of past chats.
-  // If it's a page reload, we restore the active chat normally.
-  useEffect(() => {
-    const isSessionActive = window.sessionStorage.getItem("bedrock:session_active") === "true";
-    if (!isSessionActive) {
-      persistActiveId(null);
-      setActiveId(null);
-      window.sessionStorage.setItem("bedrock:session_active", "true");
-    } else {
-      setActiveId(getActiveId());
-    }
-    setMounted(true);
-  }, []);
+  // Subscribes to a crew job's resumable progress stream for `convId` — used
+  // both for a job ChatWindow just enqueued and for reconnecting to one that
+  // was already running when the page loaded (the sweep effect below). Lives
+  // here rather than in ChatWindow because it must keep running for a
+  // conversation the user has since navigated away from — ChatWindow only
+  // ever renders the *active* conversation.
+  const attachJob = useCallback((convId, jobId, ackContent, { setBusy = false, startedAt } = {}) => {
+    const progress = {
+      steps: [
+        { key: "destination", label: "Researching your destination", state: "running" },
+        { key: "food", label: "Finding local food", state: "pending" },
+        { key: "personalization", label: "Personalizing your trip", state: "pending" },
+        { key: "accommodation", label: "Comparing places to stay", state: "pending" },
+        { key: "budget", label: "Balancing your budget", state: "pending" },
+      ],
+      percent: 0,
+      activity: { message: "Starting research" },
+    };
+    const streamingBase = () => ({ role: "assistant", content: ackContent, kind: "result", progress: { ...progress }, jobId });
+    // Set by the abort handler when the user hits Stop: live progress
+    // updates stop touching the (already-dismissed) UI, but `settle` below
+    // still has to run when the job actually finishes — otherwise the
+    // persisted placeholder Message row stays kind="job" (a stale bubble
+    // with a mislabeled Regenerate button) until the next full reload,
+    // since cancellation itself is only observed at the worker's next step
+    // boundary, not synchronously with this call.
+    const dismissed = { current: false };
 
-  const bumpVersion = () => setVersion((v) => v + 1);
+    updateStreamState(convId, {
+      ...(setBusy ? { isBusy: true, startedAt: startedAt ?? Date.now() } : {}),
+      stagingType: "research",
+      streaming: streamingBase(),
+    });
 
-  function handleNewChat() {
-    // If the active chat is already new/empty, just close the sidebar drawer
-    // and keep it active instead of spawning duplicate empty entries.
-    if (activeId) {
-      const activeConv = getConversation(activeId);
-      if (activeConv && activeConv.messages.length === 0) {
-        setDrawerOpen(false);
-        return;
+    const settle = async () => {
+      // The worker already resolved the placeholder Message row in place
+      // (kind="job" -> "result"/"error") — reload from the backend rather
+      // than appending a second row, so a fresh send and a post-reload
+      // reconnect both leave exactly one persisted message for the turn.
+      const [completedMessages] = await Promise.all([loadMessages(convId), refreshList()]);
+      const completedTicket = completedMessages[completedMessages.length - 1];
+      const hasCompletedTicket = completedTicket?.kind === "result" && completedTicket.itinerary;
+
+      if (!dismissed.current && hasCompletedTicket) {
+        // Keep the checklist and its completed ticket in one live row briefly
+        // so the two can overlap and crossfade instead of swapping frames.
+        // The ticket is passed through the stream state only for this visual
+        // handoff; the durable message remains the source of truth afterward.
+        updateStreamState(convId, {
+          stagingType: "research-completing",
+          streaming: { ...streamingBase(), completionTicket: completedTicket },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 420));
       }
-    }
+      if (!dismissed.current) updateStreamState(convId, null);
+      clearStreamController(convId);
+    };
 
-    const conversation = createConversation();
-    setActiveId(conversation.id);
+    subscribeJob(jobId, {
+      onSnapshot: (f) => {
+        if (dismissed.current) return;
+        progress.steps = f.steps || progress.steps;
+        progress.percent = f.percent ?? progress.percent;
+        updateStreamState(convId, { streaming: streamingBase() });
+      },
+      onStep: (f) => {
+        if (dismissed.current) return;
+        progress.steps = progress.steps.map((s) =>
+          s.key === f.key ? { ...s, state: f.state, detail: f.detail || s.detail } : s
+        );
+        if (typeof f.percent === "number") progress.percent = f.percent;
+        updateStreamState(convId, { streaming: streamingBase() });
+      },
+      onActivity: (f) => {
+        if (dismissed.current) return;
+        progress.activity = { message: f.message };
+        updateStreamState(convId, { streaming: streamingBase() });
+      },
+      onDone: settle,
+      onError: settle,
+    });
+    registerStreamController(convId, {
+      abort: () => {
+        // Deliberately does NOT close the SSE subscription — only the tab's
+        // own live-progress view is dismissed. `settle` still needs to run
+        // once the job actually reaches a terminal state so the persisted
+        // conversation history ends up correct even though nothing is
+        // "watching" it anymore.
+        dismissed.current = true;
+        updateStreamState(convId, null);
+        jobsApi.cancel(jobId).then(() => loadMessages(convId)).catch(() => {});
+      },
+    });
+  }, [updateStreamState, registerStreamController, clearStreamController, loadMessages, refreshList]);
+
+  // "Close the tab, come back" — reconnect to every job still queued/running
+  // for this account once on load, not just the conversation the user
+  // happens to reopen. Each attach is independent of which conversation is
+  // active, so a background run keeps going (and the sidebar dot keeps
+  // showing) even before the user revisits it.
+  const sweptJobsRef = useRef(false);
+  useEffect(() => {
+    if (sweptJobsRef.current || loadingList) return;
+    sweptJobsRef.current = true;
+    (async () => {
+      let live = [];
+      try {
+        const [running, queued] = await Promise.all([jobsApi.list("running"), jobsApi.list("queued")]);
+        live = [...(running || []), ...(queued || [])];
+      } catch {
+        return; // best-effort — a failed sweep just means no reconnect this load
+      }
+      for (const job of live) {
+        if (!job.conversation_id) continue;
+        // The real ack line is on the placeholder Message row itself — load
+        // it so the reconnected bubble shows the same text a live run would,
+        // instead of a generic filler.
+        let ackContent = "Building your itinerary…";
+        try {
+          const msgs = await loadMessages(job.conversation_id);
+          const trailing = msgs[msgs.length - 1];
+          if (trailing?.jobId === job.id && trailing.content) ackContent = trailing.content;
+        } catch {
+          /* best-effort — falls back to the generic filler */
+        }
+        attachJob(job.conversation_id, job.id, ackContent, {
+          setBusy: true,
+          startedAt: job.created_at ? new Date(job.created_at).getTime() : undefined,
+        });
+      }
+    })();
+  }, [loadingList, attachJob]);
+
+  async function handleNewChat() {
+    await startNewChat();
     setDrawerOpen(false);
-    bumpVersion();
   }
 
   function handleSelectConversation(id) {
-    persistActiveId(id);
-    setActiveId(id);
+    selectConversation(id);
   }
 
-  function handleDeleteConversation(id) {
+  async function handleDeleteConversation(id) {
     abortStream(id);
-    deleteConversation(id);
-    setActiveId(getActiveId());
-    bumpVersion();
+    await deleteConversation(id);
   }
 
-  function handleClearAll() {
+  async function handleClearAll() {
     Object.values(streamControllersRef.current).forEach((c) => c.abort());
     streamControllersRef.current = {};
     setActiveStreams({});
-    clearAllConversations();
-    setActiveId(null);
-    bumpVersion();
-  }
-
-  function ensureActiveConversation() {
-    if (activeId) return activeId;
-    const conversation = createConversation();
-    setActiveId(conversation.id);
-    bumpVersion();
-    return conversation.id;
+    await clearAll();
   }
 
   const sidebarProps = {
     activeId,
+    conversations: convList,
     onSelectConversation: handleSelectConversation,
     onNewChat: handleNewChat,
     onDeleteConversation: handleDeleteConversation,
     onClearAll: handleClearAll,
-    mounted,
-    version,
+    mounted: !loadingList,
     initialConversationCount,
     activeStreams,
   };
@@ -191,14 +284,9 @@ export default function ClientPage({ initialHasConversations, initialConversatio
             <Logo size={26} />
             <span className="text-[15px] font-bold text-ink">Bedrock</span>
           </div>
-          <ThemeToggle className="ml-auto" />
         </header>
 
         <ChatWindow
-          activeId={activeId}
-          ensureActiveConversation={ensureActiveConversation}
-          bumpVersion={bumpVersion}
-          mounted={mounted}
           initialHasConversations={initialHasConversations}
           initialActiveStructure={initialActiveStructure}
           streaming={activeStreams[activeId]?.streaming || null}
@@ -208,8 +296,20 @@ export default function ClientPage({ initialHasConversations, initialConversatio
           updateStreamState={updateStreamState}
           registerStreamController={registerStreamController}
           clearStreamController={clearStreamController}
+          attachJob={attachJob}
+          onCancel={() => abortStream(activeId)}
         />
       </main>
     </div>
+  );
+}
+
+export default function ClientPage(props) {
+  return (
+    <AuthProvider>
+      <ConversationsProvider>
+        <ClientPageInner {...props} />
+      </ConversationsProvider>
+    </AuthProvider>
   );
 }

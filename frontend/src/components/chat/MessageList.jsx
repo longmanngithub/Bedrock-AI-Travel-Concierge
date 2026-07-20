@@ -170,6 +170,8 @@ export default function MessageList({
   const isAtBottomRef = useRef(true);
   const prevUserMsgRef = useRef(null);
   const resultScrolledRef = useRef(false);
+  const handoffTicketIdRef = useRef(null);
+  const completedTicketScrolledRef = useRef(null);
 
   // Merge the internal scroll ref with the one exposed to ChatWindow.
   const setScrollRef = useCallback(
@@ -195,26 +197,44 @@ export default function MessageList({
     return () => el.removeEventListener("scroll", onScroll);
   }, [onScrollStateChange]);
 
-  // Keep scroll at bottom if it was at the bottom when clearance (composer height) changes
-  // (e.g. when quick replies render, which expands the bottom spacing).
+  // Keep a regular chat at the bottom if its composer height changes (for
+  // example, when quick replies render). A completed boarding pass is
+  // deliberately excluded: its top was brought into view while research was
+  // streaming, and moving to the bottom here would skip the itinerary header.
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && isAtBottomRef.current) {
+    const latestMessage = messages[messages.length - 1];
+    const hasCompletedTicket = latestMessage?.kind === "result" && latestMessage.itinerary;
+    if (el && isAtBottomRef.current && !hasCompletedTicket) {
       requestAnimationFrame(() => {
         el.scrollTop = el.scrollHeight;
       });
     }
-  }, [bottomClearance]);
+  }, [bottomClearance, messages, streamingMessage]);
 
   // Editing a past message temporarily hides (never deletes) everything after
   // it, so the composer's "resend from here" preview matches what will
   // actually happen — Esc brings it straight back since nothing was removed.
   const editIdx = editingMessageId ? messages.findIndex((m) => m.id === editingMessageId) : -1;
-  const visibleMessages = editIdx === -1 ? messages : messages.slice(0, editIdx + 1);
+  let visibleMessages = editIdx === -1 ? messages : messages.slice(0, editIdx + 1);
+
+  // A trailing persisted kind="job" row is the placeholder `_enqueue_plan`
+  // wrote before the worker resolved it — while `streamingMessage` is live
+  // for this same turn (a fresh send, or a reconnect-on-load), it already
+  // renders the same ack text plus the live checklist, so drop the persisted
+  // duplicate. During completion, keep the durable ticket in the live row so
+  // it can crossfade directly with the departing checklist.
+  const trailing = visibleMessages[visibleMessages.length - 1];
+  const isResearchCompleting = stagingType === "research-completing";
+  const completionTicket = isResearchCompleting ? streamingMessage?.completionTicket : null;
+  if (completionTicket?.id) handoffTicketIdRef.current = completionTicket.id;
+  if (streamingMessage && (trailing?.kind === "job" || completionTicket)) {
+    visibleMessages = visibleMessages.slice(0, -1);
+  }
 
   const lastMessage = messages[messages.length - 1];
   const isStreamingNow = Boolean(streamingMessage);
-  const isResultType = stagingType === "result";
+  const isResearchType = stagingType === "research" || isResearchCompleting;
 
   // ── Scroll rule 1: user sends a message → scroll to bottom ──
   useEffect(() => {
@@ -233,7 +253,7 @@ export default function MessageList({
 
   // ── Scroll rule 2: non-result streaming → keep at bottom as tokens arrive ──
   useEffect(() => {
-    if (!isStreamingNow || isResultType) return;
+    if (!isStreamingNow || isResearchType) return;
     const el = scrollRef.current;
     if (el && isAtBottomRef.current) {
       el.scrollTop = el.scrollHeight;
@@ -242,7 +262,7 @@ export default function MessageList({
 
   // ── Scroll rule 3: result streaming → scroll to START of the response once ──
   useEffect(() => {
-    if (isStreamingNow && isResultType) {
+    if (isStreamingNow && isResearchType) {
       if (!resultScrolledRef.current && lastRowRef.current) {
         resultScrolledRef.current = true;
         lastRowRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -250,7 +270,23 @@ export default function MessageList({
     } else {
       resultScrolledRef.current = false;
     }
-  }, [isStreamingNow, isResultType]);
+  }, [isStreamingNow, isResearchType]);
+
+  // When a background plan finishes, take the reader to the newly generated
+  // ticket even if they were reviewing an older itinerary while it ran. The
+  // target is the live handoff row, whose ticket occupies the same position as
+  // the durable message that replaces it once the crossfade is complete.
+  useEffect(() => {
+    if (!completionTicket?.id || completedTicketScrolledRef.current === completionTicket.id) return;
+    const ticketRow = lastRowRef.current;
+    if (!ticketRow) return;
+    completedTicketScrolledRef.current = completionTicket.id;
+    requestAnimationFrame(() => {
+      ticketRow.scrollIntoView({ behavior: "smooth", block: "start" });
+      isAtBottomRef.current = false;
+      onScrollStateChange?.(false);
+    });
+  }, [completionTicket?.id, onScrollStateChange]);
 
   // Read initial messages from localStorage before mount (only on client)
   let initialMessages = [];
@@ -309,7 +345,7 @@ export default function MessageList({
       {visibleMessages.map((m, i) => (
         <div key={m.id} ref={i === visibleMessages.length - 1 && !streamingMessage ? lastRowRef : undefined}>
           <MessageRow
-            message={m}
+            message={m.id === handoffTicketIdRef.current ? { ...m, skipTicketEntrance: true } : m}
             isLast={i === visibleMessages.length - 1 && !streamingMessage}
             disabled={disabled}
             onEditMessage={onEditMessage}

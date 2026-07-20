@@ -1,13 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  appendMessage,
-  getConversation,
-  truncateConversation,
-  updateMessage,
-} from "../../lib/conversations.js";
-import { streamChat } from "../../lib/api.js";
+import { streamChat, formatError } from "../../lib/api.js";
+import { useAuth } from "../../lib/AuthContext.jsx";
+import { useConversations } from "../../lib/ConversationsContext.jsx";
 import MessageList from "./MessageList.jsx";
 import Composer from "./Composer.jsx";
 
@@ -44,10 +40,6 @@ function historyContent(m) {
 }
 
 export default function ChatWindow({
-  activeId,
-  ensureActiveConversation,
-  bumpVersion,
-  mounted,
   initialHasConversations,
   initialActiveStructure,
   streaming,
@@ -57,8 +49,22 @@ export default function ChatWindow({
   updateStreamState,
   registerStreamController,
   clearStreamController,
+  attachJob,
+  onCancel,
 }) {
-  const [messages, setMessages] = useState([]);
+  const { user, loading: authLoading, forceReauth } = useAuth();
+  const {
+    activeId,
+    activeMessages: messages,
+    activeMessagesLoading,
+    loadingList,
+    ensureActiveConversation,
+    appendMessage,
+    updateMessageLocal,
+    truncateConversation,
+    loadMessages,
+    refreshList,
+  } = useConversations();
   const [draft, setDraft] = useState("");
   const [editingMessageId, setEditingMessageId] = useState(null);
   // How much bottom clearance the message list needs to keep the last message
@@ -68,10 +74,26 @@ export default function ChatWindow({
   const [composerHeight, setComposerHeight] = useState(140);
   const [isAtBottom, setIsAtBottom] = useState(true);
 
-  const activeIdRef = useRef(activeId);
   const composerRef = useRef(null);
   const composerWrapRef = useRef(null);
   const scrollContainerRef = useRef(null);
+
+  // handleSend is a plain function, recreated every render, closing over
+  // whatever `messages` that render saw. A click always *fires* against the
+  // freshest render's onClick handler in practice, but a background job's
+  // onDone can append a message and immediately re-render while a user
+  // click is already in flight, or the click can land on a handler from a
+  // render that hasn't picked up the very latest context update yet — either
+  // way, reading a stale snapshot of `messages` here means the confirmation-
+  // gate marker (embedded in the result message's history text — see
+  // historyContent) silently isn't in the history sent to /chat/stream, so
+  // "yes, finalize it" gets misread as a fresh, itinerary-less turn instead
+  // of a confirmed replan. A ref sidesteps closure staleness entirely: it's
+  // mutated directly, not tied to which render's closure got invoked.
+  const messagesRef = useRef(messages);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   const handleScrollStateChange = useCallback((atBottom) => {
     setIsAtBottom(atBottom);
@@ -95,19 +117,8 @@ export default function ChatWindow({
   }, []);
 
   useEffect(() => {
-    if (activeIdRef.current === activeId) return;
-    activeIdRef.current = activeId;
     setEditingMessageId(null);
-    setMessages(activeId ? getConversation(activeId)?.messages || [] : []);
   }, [activeId]);
-
-  function finalize(convId, msg) {
-    const persisted = appendMessage(convId, msg);
-    if (activeIdRef.current === convId && persisted) {
-      setMessages((prev) => [...prev, persisted]);
-    }
-    bumpVersion();
-  }
 
   async function runTurn(convId, historyForApi) {
     updateStreamState(convId, {
@@ -124,6 +135,7 @@ export default function ChatWindow({
 
     await streamChat(historyForApi, {
       signal: controller.signal,
+      conversationId: convId,
       onMeta: (type) => {
         acc.type = type;
         updateStreamState(convId, {
@@ -137,41 +149,39 @@ export default function ChatWindow({
           streaming: { role: "assistant", content: acc.content, kind: KIND_FOR_TYPE[acc.type] }
         });
       },
-      onDone: (payload) => {
+      onJob: (payload) => {
+        // A plannable turn: the crew runs in the BACKGROUND, and the backend
+        // has already persisted a placeholder Message (kind="job") for it —
+        // keep the stream "settled" (the SSE POST is done) and hand off to
+        // attachJob, the same code path a reconnect-after-reload uses.
         settled = true;
-        const content = payload.message ?? acc.content;
-        if (payload.type === "result") {
-          finalize(convId, {
-            role: "assistant",
-            kind: "result",
-            content,
-            itinerary: payload.itinerary || undefined,
-            tripRequest: payload.trip_request || undefined,
-            elapsedSeconds: payload.elapsed_seconds ?? undefined,
-            recordId: payload.record_id ?? undefined,
-          });
-        } else if (payload.type === "clarify") {
-          finalize(convId, {
-            role: "assistant",
-            kind: "clarify",
-            content,
-            quickReplies: (payload.quick_replies || []).map((q) => ({ label: q.label, value: q.value })),
-          });
-        } else {
-          finalize(convId, { role: "assistant", kind: "refusal", content });
-        }
+        attachJob(convId, payload.job_id, payload.message ?? acc.content);
+      },
+      onDone: async () => {
+        settled = true;
+        // The backend owns completed assistant messages so suggested replies,
+        // notification delivery, and reload behavior all share one durable row.
+        await Promise.all([loadMessages(convId), refreshList()]);
         updateStreamState(convId, null);
         clearStreamController(convId);
       },
-      onError: ({ message, networkError }) => {
+      onError: async (err) => {
         settled = true;
-        finalize(convId, {
-          role: "assistant",
-          kind: "error",
-          content: networkError
-            ? "I couldn't reach the planning service — please check your connection and try again."
-            : message || "Something went wrong. Please try again.",
-        });
+        // Session expired mid-conversation (e.g. the access cookie lapsed
+        // between page load and send): drop the session so the app-wide gate
+        // re-covers the screen, rather than dropping a scary error bubble
+        // into the transcript.
+        if (err?.code === "E_AUTH_REQUIRED") {
+          forceReauth();
+        } else {
+          await appendMessage(convId, {
+            role: "assistant",
+            kind: "error",
+            content: err?.networkError
+              ? "I couldn't reach the planning service — please check your connection and try again."
+              : formatError(err),
+          });
+        }
         updateStreamState(convId, null);
         clearStreamController(convId);
       },
@@ -179,7 +189,7 @@ export default function ChatWindow({
 
     // Stream closed without a terminal event (e.g. server dropped): surface it
     if (!settled && !controller.signal.aborted) {
-      finalize(convId, {
+      await appendMessage(convId, {
         role: "assistant",
         kind: "error",
         content: "The connection closed before I finished — please try again.",
@@ -189,28 +199,36 @@ export default function ChatWindow({
     }
   }
 
-  function handleSend(text) {
+  async function handleSend(text) {
     if (isBusy) return;
-    const convId = ensureActiveConversation();
-    // Adopt a brand-new conversation immediately, before the `activeId` prop
-    // has even re-rendered in — otherwise the prop-change effect below sees
-    // it a moment later and aborts the turn this call is about to start.
-    activeIdRef.current = convId;
+    // Defense in depth only — the app-wide gate in AuthProvider already
+    // makes this unreachable while signed out (a non-dismissible dialog
+    // covers the whole screen until login/register succeeds).
+    if (authLoading || !user) return;
+
+    // Snapshot before any await — `ensureActiveConversation` either returns
+    // the still-current activeId (this snapshot stays valid) or creates a
+    // brand-new one (in which case there were no prior messages anyway).
+    // Read from the ref, not the closed-over `messages` — see messagesRef's
+    // own comment for why the closure can be stale.
+    let baseMessages = messagesRef.current;
+
+    const convId = await ensureActiveConversation();
 
     // Resending an edited message: only now — at send time, not at the
     // moment the pencil icon was clicked — do we actually drop the old tail.
     // Cancelling (Esc) before this point leaves everything untouched.
     if (editingMessageId) {
-      truncateConversation(convId, editingMessageId);
+      await truncateConversation(convId, editingMessageId);
+      const idx = baseMessages.findIndex((m) => m.id === editingMessageId);
+      if (idx !== -1) baseMessages = baseMessages.slice(0, idx);
       setEditingMessageId(null);
     }
 
-    appendMessage(convId, { role: "user", content: text });
-    setMessages(getConversation(convId)?.messages || []);
     setDraft("");
-    bumpVersion();
+    const userMsg = await appendMessage(convId, { role: "user", content: text });
 
-    const history = (getConversation(convId)?.messages || []).map((m) => ({
+    const history = [...baseMessages, userMsg].map((m) => ({
       role: m.role,
       content: historyContent(m),
     }));
@@ -219,8 +237,7 @@ export default function ChatWindow({
 
   function handlePickQuickReply(messageId, value) {
     if (activeId) {
-      updateMessage(activeId, messageId, { quickRepliesConsumed: true });
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, quickRepliesConsumed: true } : m)));
+      updateMessageLocal(activeId, messageId, { quickRepliesConsumed: true });
     }
     handleSend(value);
   }
@@ -230,7 +247,7 @@ export default function ChatWindow({
   // (see handleSend); pressing Esc or navigating away leaves history intact.
   function handleEditMessage(messageId) {
     if (!activeId || isBusy) return;
-    const target = getConversation(activeId)?.messages.find((m) => m.id === messageId);
+    const target = messages.find((m) => m.id === messageId);
     if (!target) return;
     setEditingMessageId(messageId);
     setDraft(target.content);
@@ -243,16 +260,15 @@ export default function ChatWindow({
   }
 
   // Regenerate: drop the given assistant reply and replay the preceding history.
-  function handleRegenerate(messageId) {
+  async function handleRegenerate(messageId) {
     if (!activeId || isBusy) return;
-    const conv = getConversation(activeId);
-    if (!conv) return;
-    const idx = conv.messages.findIndex((m) => m.id === messageId);
+    // Same stale-closure concern as handleSend — this history feeds the crew
+    // the same way, so it needs the freshest message set too.
+    const current = messagesRef.current;
+    const idx = current.findIndex((m) => m.id === messageId);
     if (idx === -1) return;
-    const historyBefore = conv.messages.slice(0, idx).map((m) => ({ role: m.role, content: historyContent(m) }));
-    truncateConversation(activeId, messageId);
-    setMessages(getConversation(activeId)?.messages || []);
-    bumpVersion();
+    const historyBefore = current.slice(0, idx).map((m) => ({ role: m.role, content: historyContent(m) }));
+    await truncateConversation(activeId, messageId);
     runTurn(activeId, historyBefore);
   }
 
@@ -260,19 +276,36 @@ export default function ChatWindow({
   // again clears it.
   function handleFeedback(messageId, value) {
     if (!activeId) return;
-    const current = getConversation(activeId)?.messages.find((m) => m.id === messageId)?.feedback;
+    const current = messages.find((m) => m.id === messageId)?.feedback;
     const next = current === value ? null : value;
-    updateMessage(activeId, messageId, { feedback: next });
-    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, feedback: next } : m)));
+    updateMessageLocal(activeId, messageId, { feedback: next });
   }
 
-  // At most one clarify prompt is ever "live": the trailing assistant turn,
-  // and only until its quick replies are consumed or streaming resumes.
   const lastMessage = messages[messages.length - 1];
-  const activeClarify =
-    !streaming && !isBusy && lastMessage?.role === "assistant" && lastMessage?.kind === "clarify" && !lastMessage?.quickRepliesConsumed
+  const activeSuggestions =
+    !streaming && !isBusy && lastMessage?.role === "assistant" && Array.isArray(lastMessage?.quickReplies) &&
+    lastMessage.quickReplies.length > 0 && !lastMessage?.quickRepliesConsumed
       ? lastMessage
       : null;
+
+  async function handleStop() {
+    // Direct HTTP stream aborts do not reach a terminal backend frame. Persist
+    // the requested feedback locally; queued jobs persist their own stopped
+    // placeholder through the cancellation endpoint.
+    if (activeId && !streaming?.jobId) {
+      await appendMessage(activeId, {
+        role: "assistant",
+        kind: "stopped",
+        content: "You stopped this response.",
+      });
+    }
+    onCancel?.();
+  }
+
+  // "Mounted" here means: we know the real conversation list AND, if one is
+  // active, its messages have finished loading — otherwise MessageList would
+  // briefly flash the Welcome screen before a non-empty history pops in.
+  const mounted = !authLoading && !loadingList && !activeMessagesLoading;
 
   return (
     // Composer floats over the message list (absolute, bottom-anchored) so
@@ -306,10 +339,11 @@ export default function ChatWindow({
           inputRef={composerRef}
           isEditing={Boolean(editingMessageId)}
           onCancelEdit={handleCancelEdit}
-          quickReplies={activeClarify?.quickReplies || []}
-          onPickQuickReply={(value) => activeClarify && handlePickQuickReply(activeClarify.id, value)}
+          quickReplies={activeSuggestions?.quickReplies || []}
+          onPickQuickReply={(value) => activeSuggestions && handlePickQuickReply(activeSuggestions.id, value)}
           isAtBottom={isAtBottom}
           onScrollToBottom={scrollToBottom}
+          onCancel={handleStop}
         />
       </div>
     </div>

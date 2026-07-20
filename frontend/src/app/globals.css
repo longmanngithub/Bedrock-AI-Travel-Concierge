@@ -28,6 +28,8 @@
   --animate-pulse-dot: pulse-dot 1.2s ease-in-out infinite;
   --animate-caret: caret 1s step-end infinite;
   --animate-fade-in: fade-in 200ms ease-out;
+  --animate-spin: spin 0.7s linear infinite;
+  --animate-breathe: breathe 2.2s ease-in-out infinite;
 }
 
 .dark {
@@ -67,6 +69,28 @@
   }
 }
 
+@keyframes checklist-handoff-out {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-16px) scale(0.97);
+  }
+}
+
+@keyframes ticket-handoff-in {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 @keyframes pulse-dot {
   0%,
   100% {
@@ -92,6 +116,62 @@
 @keyframes shimmer {
   100% {
     transform: translateX(100%);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A slow, subtle breathing scale+opacity — used to signal "actively working"
+   on icons/rows that otherwise sit still between discrete progress updates. */
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* The completion row holds both states in the same grid cell: the ticket
+   emerges before the checklist leaves, so the handoff feels continuous rather
+   than like React replaced one component with another. */
+.ticket-handoff {
+  display: grid;
+  align-items: start;
+  isolation: isolate;
+}
+.ticket-handoff-checklist,
+.ticket-handoff-ticket {
+  grid-area: 1 / 1;
+  will-change: opacity, transform;
+}
+.ticket-handoff-checklist {
+  z-index: 1;
+  pointer-events: none;
+  animation: checklist-handoff-out 420ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.ticket-handoff-ticket {
+  opacity: 0;
+  pointer-events: none;
+  animation: ticket-handoff-in 360ms cubic-bezier(0.22, 1, 0.36, 1) 60ms forwards;
+}
+.ticket-handoff-ticket .animate-msg-in,
+.ticket-handoff-settled .animate-msg-in {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ticket-handoff-checklist,
+  .ticket-handoff-ticket {
+    animation-delay: 0ms;
+    animation-duration: 1ms;
   }
 }
 
@@ -141,6 +221,21 @@ body {
     transparent
   );
   animation: shimmer 1.5s infinite;
+}
+
+/* Same sweep, tuned for a solid brand-colored fill (e.g. an in-progress bar)
+   instead of a muted skeleton block — a light band instead of a surface one. */
+.shimmer-on-brand {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer-on-brand::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+  animation: shimmer 1.6s infinite;
 }
 
 /* Boarding-pass perforation: a dashed tear line with a punched notch cut into
