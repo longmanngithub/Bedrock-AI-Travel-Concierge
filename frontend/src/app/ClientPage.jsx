@@ -105,7 +105,14 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
       // (kind="job" -> "result"/"error") — reload from the backend rather
       // than appending a second row, so a fresh send and a post-reload
       // reconnect both leave exactly one persisted message for the turn.
-      const [completedMessages] = await Promise.all([loadMessages(convId), refreshList()]);
+      // Silent: the user is watching this conversation right now, so these
+      // refetches must reconcile underneath the UI rather than dropping it
+      // back to skeletons for the length of a round trip (see the note on
+      // refreshList in ConversationsContext).
+      const [completedMessages] = await Promise.all([
+        loadMessages(convId, { silent: true }),
+        refreshList({ silent: true }),
+      ]);
       const completedTicket = completedMessages[completedMessages.length - 1];
       const hasCompletedTicket = completedTicket?.kind === "result" && completedTicket.itinerary;
 
@@ -156,7 +163,7 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
         // "watching" it anymore.
         dismissed.current = true;
         updateStreamState(convId, null);
-        jobsApi.cancel(jobId).then(() => loadMessages(convId)).catch(() => {});
+        jobsApi.cancel(jobId).then(() => loadMessages(convId, { silent: true })).catch(() => {});
       },
     });
   }, [updateStreamState, registerStreamController, clearStreamController, loadMessages, refreshList]);

@@ -161,7 +161,12 @@ export default function ChatWindow({
         settled = true;
         // The backend owns completed assistant messages so suggested replies,
         // notification delivery, and reload behavior all share one durable row.
-        await Promise.all([loadMessages(convId), refreshList()]);
+        // Silent: this reconciles a transcript already on screen, so it must
+        // not flip the loading flags and blink the UI back to skeletons.
+        await Promise.all([
+          loadMessages(convId, { silent: true }),
+          refreshList({ silent: true }),
+        ]);
         updateStreamState(convId, null);
         clearStreamController(convId);
       },

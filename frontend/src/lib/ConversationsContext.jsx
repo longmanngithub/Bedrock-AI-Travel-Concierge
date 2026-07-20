@@ -53,17 +53,25 @@ export function ConversationsProvider({ children }) {
   const [loadingMessagesFor, setLoadingMessagesFor] = useState(null);
   const migratedRef = useRef(false);
 
-  const refreshList = useCallback(async () => {
-    setLoadingList(true);
+  // `silent: true` re-fetches without flipping the loading flag. The flag
+  // drives skeleton placeholders, which are right for a first load (there is
+  // nothing else to show) but wrong for a background re-sync of data already
+  // on screen: `mounted` in ChatWindow/Sidebar is derived from these flags, so
+  // toggling one mid-session collapses the whole UI back to skeletons and then
+  // restores it — a visible blink for however long the round trip takes. Use
+  // it for any refetch that is reconciling state the user is already looking
+  // at (see settle() in ClientPage).
+  const refreshList = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoadingList(true);
     try {
       const rows = await api.list();
       setList(rows);
       return rows;
     } catch {
-      setList([]);
+      if (!silent) setList([]);
       return [];
     } finally {
-      setLoadingList(false);
+      if (!silent) setLoadingList(false);
     }
   }, []);
 
@@ -118,9 +126,12 @@ export function ConversationsProvider({ children }) {
     else window.sessionStorage.removeItem(ACTIVE_ID_KEY);
   }, []);
 
-  const loadMessages = useCallback(async (convId) => {
+  // `silent: true` — same rationale as refreshList above: skip the loading
+  // flag when re-reading messages the user is already looking at, so the
+  // transcript doesn't blink through the Welcome/skeleton state mid-session.
+  const loadMessages = useCallback(async (convId, { silent = false } = {}) => {
     if (!convId) return [];
-    setLoadingMessagesFor(convId);
+    if (!silent) setLoadingMessagesFor(convId);
     try {
       const rows = await api.messages(convId);
       const msgs = rows.map(toClientMessage);
@@ -129,7 +140,7 @@ export function ConversationsProvider({ children }) {
     } catch {
       return [];
     } finally {
-      setLoadingMessagesFor((cur) => (cur === convId ? null : cur));
+      if (!silent) setLoadingMessagesFor((cur) => (cur === convId ? null : cur));
     }
   }, []);
 
