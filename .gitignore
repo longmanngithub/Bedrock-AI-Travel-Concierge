@@ -11,6 +11,9 @@ venv/
 # RAG vector store (regenerate with `python -m app.rag.ingest`)
 backend/app/rag/chroma_store/
 
+# Local avatar storage fallback (runtime data, not source)
+backend/data/
+
 # Evaluation harness + outputs (not pushed to GitHub)
 backend/evaluation/
 

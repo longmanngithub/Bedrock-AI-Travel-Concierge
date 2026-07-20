@@ -121,5 +121,15 @@ def run_baseline(request: TripRequest) -> tuple[Itinerary, float, int]:
         )
     if not itinerary.num_days:
         itinerary.num_days = request.num_days
+    # `sources` is not in _SCHEMA_HINT, but the model has seen enough
+    # travel-app JSON with a citations array that it sometimes invents one
+    # anyway (verified live: real ids/URLs/dates matching the *shape* of a
+    # real Source but not any actual lookup) — Pydantic accepts it silently
+    # since it's a real field. The baseline has no tools and no web access,
+    # so it structurally cannot ground a citation; force this empty rather
+    # than relying on a prompt instruction an LLM can ignore. This is also
+    # the honest, useful comparison point: baseline provides zero verifiable
+    # sources versus the crew's real ones.
+    itinerary.sources = []
     tokens = _count_tokens(llm.model, _SYSTEM_PROMPT, user_prompt, raw)
     return itinerary, elapsed, tokens

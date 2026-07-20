@@ -42,7 +42,14 @@ REQUIRED_FIELDS = ["destination", "budget", "start_date", "end_date"]
 _AFFIRMATION_RE = re.compile(
     r"^\s*(yes|yeah|yep|yup|sure|ok(ay)?|go ahead|do it|please\b|sounds good|"
     r"go for it|update it|let'?s do it|apply (it|that)|make (it|that) happen|"
-    r"confirmed?|correct|that works|perfect|great|sounds great|absolutely)\b",
+    r"confirmed?|correct|that works|perfect|great|sounds great|absolutely|"
+    # Added after a live miss: "It is finalized" doesn't start with any word
+    # above, so it silently failed this gate and extended a confirm loop by
+    # another turn (see git history for the reproduction). These cover the
+    # other common ways people confirm without leading with a "yes"-word.
+    r"add it|looks good|works for me|that'?s fine|i'?m ready|ready to (go|finalize)|"
+    r"finaliz(e|ed|ing)(\s+(it|that))?|"
+    r"(it|that)('?s| is| was)?\s*(now\s+|already\s+)?finaliz(e|ed|ing))\b",
     re.IGNORECASE,
 )
 
@@ -73,6 +80,17 @@ class ChatRequest(BaseModel):
     # older frontend builds without it still degrade to "always build fresh"
     # rather than erroring.
     client_id: str | None = Field(None, max_length=100)
+    # Server-side conversation this turn belongs to (once the user has an
+    # account). Optional so anonymous/landing chat still works.
+    conversation_id: str | None = Field(None, max_length=64)
+    # Client-generated per-send key so a network retry of the SAME send doesn't
+    # enqueue the crew twice (see queue/enqueue.py two-layer idempotency).
+    idempotency_key: str | None = Field(None, max_length=64)
+    # Reverse-geocoded "City, Country" from the user's opted-in browser
+    # location (see routers/geo.py). A hint, not an instruction: only ever
+    # used to backstop `origin` when the model didn't already extract one
+    # from the conversation itself — see extract_turn.
+    location_hint: str | None = Field(None, max_length=200)
 
 
 class QuickReply(BaseModel):
@@ -125,6 +143,12 @@ class ExtractionResult(BaseModel):
     assistant_reply: str | None = ""
     quick_reply_slot: str | None = ""
     quick_reply_options: list[str] = Field(default_factory=list)
+    # LLM routing (see routing.py). Derived deterministically AFTER the
+    # backstops below, from on_topic/ready_to_plan — so a model that never
+    # emits it behaves exactly as before. Only "plan"/"revise" reach the crew;
+    # "smalltalk"/"clarify"/"answer" settle in a single cheap reply.
+    #   smalltalk | refusal | clarify | answer | plan | revise
+    route: str = "clarify"
 
     @field_validator("assistant_reply", "quick_reply_slot", mode="before")
     @classmethod
@@ -340,6 +364,15 @@ Field notes:
        whether they'd like it applied now (e.g. "Want me to fold that into
        your itinerary now, or is there anything else you'd like to add
        first?"). Do NOT set ready_to_plan true yet — wait for their answer.
+       Keep this reply narrowly focused on THAT question — do not also raise
+       an unrelated topic of your own (e.g. a tangential question about visas,
+       weather, packing) in the same reply. A pending confirmation must be the
+       one thing the traveller's next short reply ("sure", "yes") is clearly
+       answering; adding a second question makes their reply ambiguous about
+       which one it's responding to and stalls the confirmation another turn.
+       You also have no way to actually search flights/prices from this chat
+       turn — never claim you're "searching" or "found" fares here; that only
+       happens once the itinerary is actually (re)built.
     2. VAGUE request with no specifics — "make it better", "I don't love
        day 3", "can you improve this" — these express a desire for change but
        don't say WHAT to change. Leave "special_requests" unchanged (don't
@@ -788,13 +821,18 @@ def _validate_quick_replies(result: ExtractionResult) -> list[str]:
     return _SLOT_DEFAULTS.get(primary, [])
 
 
-def extract_turn(messages: list[ChatTurn]) -> ExtractionResult:
+def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> ExtractionResult:
     """Run the single slot-extraction / intent-classification LLM call.
 
     Never raises on a malformed model response — a JSON parse or schema
     validation failure degrades to a soft "please rephrase" clarify result
     instead of surfacing a 500 to the client. Genuine LLM/transport failures
     (network, auth, rate limit exhaustion) still propagate to the caller.
+
+    `location_hint`, when given, is a reverse-geocoded "City, Country" from
+    the traveller's opted-in browser location (see routers/geo.py) — never
+    asked of the model, only used below as a deterministic backstop for
+    `origin` when the conversation itself didn't establish one.
     """
     llm = build_llm(temperature=0.2)
     raw = call_with_retry(llm, _build_extraction_messages(messages))
@@ -810,6 +848,14 @@ def extract_turn(messages: list[ChatTurn]) -> ExtractionResult:
 
     # Deterministic backstop for the "no emoji" prompt rule — see strip_emoji.
     result.assistant_reply = strip_emoji(result.assistant_reply)
+
+    # Deterministic origin backstop: only fills a gap the model left, never
+    # overrides an origin the traveller actually stated in the conversation.
+    # Sanitized per this module's wrap-and-sanitize convention for any new
+    # text that ends up in a crew prompt (see tasks.py's origin interpolation)
+    # even though the source (Google's Geocoding API) is low-risk.
+    if not result.slots.origin and location_hint:
+        result.slots.origin = sanitize_untrusted(location_hint)
 
     # Deterministic date arithmetic: if the model gave a start_date and a
     # duration but (correctly, per the prompt) left end_date for us to
@@ -928,4 +974,22 @@ def extract_turn(messages: list[ChatTurn]) -> ExtractionResult:
     # whenever there's a mismatch.
     result.quick_reply_options = _validate_quick_replies(result)
 
+    # LLM routing: derived LAST, from the now-authoritative on_topic /
+    # ready_to_plan (after every backstop above has run), so it never disturbs
+    # that hard-won logic — it only labels the outcome for the caller.
+    result.route = _derive_route(result, messages)
     return result
+
+
+def _derive_route(result: ExtractionResult, messages: list[ChatTurn]) -> str:
+    """Map the settled extraction onto a coarse route. Only plan/revise run the
+    crew; everything else is a single cheap reply and never enqueues a job."""
+    if not result.on_topic:
+        return "refusal"
+    if result.ready_to_plan:
+        return "revise" if _itinerary_already_exists(messages) else "plan"
+    # On-topic, not planning: a slot-filling question vs. a standalone
+    # informational answer. Missing required slots -> we're still collecting.
+    if result.missing_required:
+        return "clarify"
+    return "answer"

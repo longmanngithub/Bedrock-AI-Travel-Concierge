@@ -37,9 +37,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# curl is only used by the container HEALTHCHECK below.
+# curl is only used by the container HEALTHCHECK below. The libpango/libcairo/
+# libgdk-pixbuf/libffi set is WeasyPrint's native dependency for HTML->PDF
+# rendering (boarding-pass delivery PDFs) — unlike macOS/Homebrew, apt installs
+# these to the standard linker search path, so no DYLD_* shim is needed here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libpangoft2-1.0-0 \
+        libgdk-pixbuf2.0-0 \
+        libcairo2 \
+        libffi8 \
+        shared-mime-info \
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 appuser
 
@@ -51,7 +62,7 @@ COPY . .
 # fast and don't re-embed the knowledge base on every boot.
 RUN python -m app.rag.ingest
 
-RUN chown -R appuser:appuser /app
+RUN chmod +x /app/entrypoint.sh && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
@@ -59,4 +70,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
+# The entrypoint bootstraps the DB schema (API container only; the worker sets
+# ALEMBIC_SKIP=1) then execs the CMD. API default below; the worker overrides
+# CMD with `arq app.queue.worker.WorkerSettings`.
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

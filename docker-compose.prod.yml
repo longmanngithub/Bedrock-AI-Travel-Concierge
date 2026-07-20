@@ -1,5 +1,5 @@
 # Production stack for a DigitalOcean droplet (or any single-host Docker
-# deployment). Local dev keeps using docker-compose.yml (Postgres only) with
+# deployment). Local dev keeps using docker-compose.yml (Postgres + Redis) with
 # `uvicorn --reload` / `npm run dev` — this file containerizes everything.
 #
 # Usage (from the repo root, after copying .env.example -> .env and filling
@@ -7,8 +7,59 @@
 #
 #   docker compose -f docker-compose.prod.yml up -d --build
 #
-# Docker Compose automatically loads a `.env` file from the current directory
-# for the ${VAR} substitutions below.
+# The crew runs in the `worker` service (background), NOT in the request path.
+# Recommended droplet size: 4 GB RAM — the worker holds torch + Chroma + the
+# embedding model (~1.2 GB) plus a per-kickoff delta; 2 GB will OOM under load.
+
+# Shared env for the two Python services (API + worker). YAML anchor keeps them
+# in sync so a model/DB/auth setting can't drift between them.
+x-backend-env: &backend-env
+  MODEL: ${MODEL:-vertex_ai/gemini-2.5-flash-lite}
+  JUDGE_MODEL: ${JUDGE_MODEL:-vertex_ai/gemini-2.5-flash-lite}
+  # Optional per-tier model overrides (see app/routing.py). Unset -> all tiers
+  # fall back to MODEL, i.e. today's single-model behaviour.
+  TIER_CHEAP: ${TIER_CHEAP:-}
+  TIER_STANDARD: ${TIER_STANDARD:-}
+  TIER_QUALITY: ${TIER_QUALITY:-}
+  VERTEXAI_PROJECT: ${VERTEXAI_PROJECT:?set VERTEXAI_PROJECT in .env}
+  VERTEXAI_LOCATION: ${VERTEXAI_LOCATION:-global}
+  GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key.json
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-concierge}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-concierge}
+  REDIS_URL: redis://redis:6379/0
+  # Auth (see app/config.py). JWT_SECRET MUST be a long random string in prod.
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (a long random string)}
+  COOKIES_SECURE: ${COOKIES_SECURE:-true}
+  FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in .env}
+  GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+  GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+  GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+  RATE_LIMIT_GENERATE: ${RATE_LIMIT_GENERATE:-20/minute}
+  # Account activation and automatic completed-response email. RESEND_API_KEY
+  # plus a verified EMAIL_FROM sender are required in production.
+  RESEND_API_KEY: ${RESEND_API_KEY:-}
+  EMAIL_FROM: "${EMAIL_FROM:-AI Travel Concierge <onboarding@resend.dev>}"
+  EMAIL_VERIFICATION_SECRET: ${EMAIL_VERIFICATION_SECRET:-}
+  OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-600}
+  OTP_RESEND_COOLDOWN_SECONDS: ${OTP_RESEND_COOLDOWN_SECONDS:-60}
+  OTP_MAX_ATTEMPTS: ${OTP_MAX_ATTEMPTS:-5}
+  # Automatic itinerary PDF delivery to Telegram (worker-only feature — the
+  # cron poller lives in app/queue/telegram_poll.py). Unset disables it.
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  # R2 is preferred in production. The named local volume remains a durable
+  # fallback when AVATAR_STORAGE_BACKEND=local.
+  AVATAR_STORAGE_BACKEND: ${AVATAR_STORAGE_BACKEND:-local}
+  AVATAR_LOCAL_DIR: /var/lib/bedrock/avatars
+  R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+  R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+  R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+  R2_BUCKET: ${R2_BUCKET:-}
+  # Grounded data sources (Phase 2) — each independently optional.
+  TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+  GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
+  TRAVELPAYOUTS_TOKEN: ${TRAVELPAYOUTS_TOKEN:-}
+  TRAVELPAYOUTS_MARKER: ${TRAVELPAYOUTS_MARKER:-621166}
 
 services:
   db:
@@ -28,10 +79,21 @@ services:
       retries: 5
     networks:
       - concierge_net
-    # No published port: only the backend container needs to reach Postgres.
-    # Uncomment to debug with a local psql client against the droplet:
-    # ports:
-    #   - "127.0.0.1:5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: concierge-redis
+    restart: unless-stopped
+    # Progress streams only (Postgres is the source of truth). Cap memory + evict
+    # oldest so a burst of jobs can't OOM the box.
+    command: ["redis-server", "--maxmemory", "192mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - concierge_net
 
   backend:
     build:
@@ -42,25 +104,52 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    # The API container OWNS migrations (entrypoint runs app.db_bootstrap).
     environment:
-      MODEL: ${MODEL:-vertex_ai/gemini-2.5-flash-lite}
-      JUDGE_MODEL: ${JUDGE_MODEL:-vertex_ai/gemini-2.5-flash-lite}
-      VERTEXAI_PROJECT: ${VERTEXAI_PROJECT:?set VERTEXAI_PROJECT in .env}
-      VERTEXAI_LOCATION: ${VERTEXAI_LOCATION:-global}
-      # Points at the service-account key mounted below — see DEPLOYMENT.md §4.
-      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key.json
-      # Only needed if you switch MODEL back to a gemini/ (Developer API) id.
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-concierge}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-concierge}
-      API_KEY: ${API_KEY:-}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
-      RATE_LIMIT_GENERATE: ${RATE_LIMIT_GENERATE:-20/minute}
+      <<: *backend-env
+      # uvicorn worker process count (entrypoint.sh). Only the API container
+      # scales this — the crew-free process is cheap enough (~250 MB) to run
+      # more than one, unlike the worker, which holds ~1.2 GB of torch/Chroma
+      # per process. Raising this multiplies DB pool usage (DB_POOL_SIZE
+      # below) and in-memory state per process, which is why rate limiting is
+      # Redis-backed (app/rate_limit.py) rather than in-memory.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
     volumes:
-      # Vertex AI auth: a GCP service-account key, read-only. Never commit
-      # this file — see DEPLOYMENT.md §4 for how to create and place it.
       - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
+      - concierge_avatars:/var/lib/bedrock/avatars
+    # Same-origin behind nginx in production: bind to localhost only so the API
+    # isn't directly exposed; nginx proxies /api/* to it. See DEPLOYMENT.md.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    networks:
+      - concierge_net
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: concierge-worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started   # let the API run migrations first
+    environment:
+      <<: *backend-env
+      # The worker must NOT race the API on migrations.
+      ALEMBIC_SKIP: "1"
+    volumes:
+      - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
+    command: ["arq", "app.queue.worker.WorkerSettings"]
+    # Give in-flight crew runs time to drain on a rolling deploy.
+    stop_grace_period: 60s
     networks:
       - concierge_net
 
@@ -69,9 +158,6 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Baked into the client bundle at build time — must be the
-        # public-facing URL the browser will call (droplet IP or domain),
-        # not the internal "backend" service name.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL in .env}
         NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
     container_name: concierge-frontend
@@ -79,7 +165,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     networks:
       - concierge_net
 
@@ -89,3 +175,4 @@ networks:
 
 volumes:
   concierge_pgdata:
+  concierge_avatars:

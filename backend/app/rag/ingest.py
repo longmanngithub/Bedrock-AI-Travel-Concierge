@@ -51,7 +51,10 @@ def main() -> None:
         shutil.rmtree(chroma_path)
 
     print(f"Embedding with {settings.embedding_model} (first run downloads the model)...")
-    embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+    # Same device pin as crew/tools.py::_get_retriever — keeps ingest and
+    # runtime retrieval on identical hardware paths (CPU), and sidesteps
+    # PyTorch MPS's thread-safety issues on Apple Silicon dev machines.
+    embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model, model_kwargs={"device": "cpu"})
     Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,

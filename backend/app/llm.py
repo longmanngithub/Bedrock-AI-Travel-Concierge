@@ -12,10 +12,13 @@ import os
 import re
 import time
 from collections.abc import Iterator
-
-from crewai import LLM
+from typing import TYPE_CHECKING
 
 from .config import get_settings
+from .errors import AppError, ErrorCode
+
+if TYPE_CHECKING:  # `from crewai import LLM` pulls a heavy chain — keep it out of
+    from crewai import LLM  # the API process; imported lazily inside build_llm.
 
 
 def _export_provider_keys() -> None:
@@ -37,16 +40,27 @@ def _export_provider_keys() -> None:
         os.environ.setdefault("GOOGLE_CLOUD_LOCATION", settings.vertex_location)
 
 
-def build_llm(model: str | None = None, temperature: float = 0.4) -> LLM:
+def build_llm(model: str | None = None, temperature: float = 0.4, *, task: str | None = None) -> LLM:
     """Return a CrewAI LLM for the given (or default) model id.
 
     CrewAI 1.x routes `gemini/` models through Google's native SDK (installed
     via the `google-genai` dependency), and other providers such as
     `groq/` and `ollama/` through LiteLLM. Either way, switching provider is a
     one-line change in `.env` with no code edits here.
+
+    Model resolution order: an explicit `model` always wins; otherwise if a
+    `task` is given the model comes from the tier mapping (see routing.py);
+    otherwise the legacy single `settings.model`. This is the one entry point —
+    all tiering flows through here rather than a second factory.
     """
+    from crewai import LLM  # lazy: keeps crewai/torch out of the API import graph
+
     _export_provider_keys()
     settings = get_settings()
+    if model is None and task is not None:
+        from .routing import model_for  # local import: routing imports config, avoid cycles
+
+        model = model_for(task)
     kwargs: dict = {"model": model or settings.model, "temperature": temperature}
     # A request timeout stops a single stalled call from hanging the whole run;
     # num_retries lets LiteLLM recover from a transient blip before the error
@@ -61,11 +75,12 @@ def build_llm(model: str | None = None, temperature: float = 0.4) -> LLM:
 
 def build_judge_llm(temperature: float = 0.0) -> LLM:
     """Deterministic LLM used by the evaluation harness for grading."""
-    settings = get_settings()
-    return build_llm(model=settings.judge_model, temperature=temperature)
+    return build_llm(task="judge", temperature=temperature)
 
 
-def stream_call(prompt: str | list[dict], temperature: float = 0.7) -> Iterator[str]:
+def stream_call(
+    prompt: str | list[dict], temperature: float = 0.7, *, task: str = "reply"
+) -> Iterator[str]:
     """Yield the model's reply token-by-token as it is generated.
 
     Used by the conversational front door so the chat UI can render the
@@ -86,19 +101,22 @@ def stream_call(prompt: str | list[dict], temperature: float = 0.7) -> Iterator[
     """
     _export_provider_keys()
     settings = get_settings()
+    from .routing import model_for  # local import to avoid an import cycle
+
+    model = model_for(task)
     try:
         import litellm
 
         messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
         kwargs: dict = {
-            "model": settings.model,
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
         }
         if settings.request_timeout:
             kwargs["timeout"] = settings.request_timeout
-        if settings.vertex_project and settings.model.startswith("vertex_ai/"):
+        if settings.vertex_project and model.startswith("vertex_ai/"):
             kwargs["vertex_project"] = settings.vertex_project
             kwargs["vertex_location"] = settings.vertex_location
         for chunk in litellm.completion(**kwargs):
@@ -132,9 +150,11 @@ def call_with_retry(llm: LLM, prompt: str | list[dict], max_retries: int = 6) ->
         except Exception as exc:  # noqa: BLE001 - we re-raise if it's not a 429
             msg = str(exc)
             if "429" not in msg and "RESOURCE_EXHAUSTED" not in msg:
-                raise
+                # Not a rate-limit — map to a safe code rather than leaking the
+                # provider exception upward as a raw string.
+                raise AppError(ErrorCode.E_LLM_UNAVAILABLE, log_detail=msg) from exc
             if attempt == max_retries - 1:
-                raise
+                raise AppError(ErrorCode.E_LLM_RATE_LIMITED, log_detail=msg) from exc
             m = re.search(r"retry(?:Delay)?['\":\s]*([0-9]+(?:\.[0-9]+)?)s", msg)
             delay = float(m.group(1)) + 1 if m else min(2 ** attempt * 5, 60)
             time.sleep(delay)

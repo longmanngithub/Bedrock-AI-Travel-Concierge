@@ -11,7 +11,7 @@ from crewai import Agent
 
 from ..config import get_settings
 from ..llm import build_llm
-from .tools import estimate_budget, knowledge_base, web_search
+from .tools import estimate_budget, flight_price_lookup, knowledge_base, places_lookup, web_search
 
 # Appended to every agent's backstory below. CrewAI compiles role/goal/
 # backstory into the agent's actual system-role message (verified against
@@ -61,9 +61,11 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         backstory=(
             "A seasoned travel researcher who has visited dozens of countries and "
             "always cross-checks recommendations against curated guides and the "
-            "live web before suggesting them. " + _INJECTION_CAUTION
+            "live web before suggesting them. When the traveller's origin is "
+            "known, checks real recent flight prices instead of guessing. "
+            + _INJECTION_CAUTION
         ),
-        tools=rag([knowledge_base, web_search]),
+        tools=rag([knowledge_base, web_search]) + [places_lookup, flight_price_lookup],
         llm=llm,
         verbose=True,
         allow_delegation=False,
@@ -81,9 +83,11 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         backstory=(
             "A food writer who champions authentic local eating over tourist "
-            "traps and always notes an approximate price range. " + _INJECTION_CAUTION
+            "traps, always notes an approximate price range, and verifies a "
+            "restaurant is real via Places before recommending it by name. "
+            + _INJECTION_CAUTION
         ),
-        tools=rag([web_search, knowledge_base]),
+        tools=rag([web_search, knowledge_base]) + [places_lookup],
         llm=llm,
         verbose=True,
         allow_delegation=False,
@@ -132,9 +136,10 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
             "city on the beat and always matches lodging to how a traveller "
             "actually wants to spend their days — close to the anime districts "
             "for one traveller, near the food markets for another — rather than "
-            "defaulting to whatever is most reviewed. " + _INJECTION_CAUTION
+            "defaulting to whatever is most reviewed. Verifies a property is "
+            "real via Places before recommending it by name. " + _INJECTION_CAUTION
         ),
-        tools=rag([web_search, knowledge_base]),
+        tools=rag([web_search, knowledge_base]) + [places_lookup],
         llm=llm,
         verbose=True,
         allow_delegation=False,

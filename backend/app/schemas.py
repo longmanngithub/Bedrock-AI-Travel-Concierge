@@ -106,11 +106,28 @@ class TripRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Output (canonical itinerary schema)
 # ---------------------------------------------------------------------------
+class Source(BaseModel):
+    """A citation for grounded output.
+
+    Phase 1 defines the shape (all defaults, unpopulated); Phase 2 populates it
+    from the SourceRegistry in crew/tools.py AFTER kickoff, so a URL never has
+    to survive an LLM token round-trip. `id` is the short handle ("s1") the
+    agents cite; sub-models reference it via `source_ids`.
+    """
+
+    id: str = ""
+    title: str = ""
+    url: str = ""
+    publisher: str = ""
+    retrieved_at: str = ""
+
+
 class Restaurant(BaseModel):
     name: str
     cuisine: str = ""
     price_range: str = Field("", description="e.g. $, $$, $$$")
     note: str = ""
+    source_ids: list[str] = Field(default_factory=list)
 
 
 class AccommodationOption(BaseModel):
@@ -118,6 +135,7 @@ class AccommodationOption(BaseModel):
     area: str = ""
     price_range: str = Field("", description="e.g. $, $$, $$$ or a per-night estimate")
     note: str = ""
+    source_ids: list[str] = Field(default_factory=list)
 
 
 class DayPlan(BaseModel):
@@ -166,3 +184,9 @@ class Itinerary(BaseModel):
         ),
     )
     reviewer_notes: str = ""
+    # Grounded citations. Empty for the baseline (a single LLM call has no
+    # grounded sources — an honest, and useful, comparison axis) and unpopulated
+    # for the crew until Phase 2 wires tools.py's SourceRegistry. MUST stay
+    # default-empty: `tasks.py` uses output_pydantic=Itinerary, and any required
+    # field raises the structured-output failure rate on a flash-lite model.
+    sources: list[Source] = Field(default_factory=list)
