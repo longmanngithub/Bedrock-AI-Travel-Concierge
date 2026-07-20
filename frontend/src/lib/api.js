@@ -166,6 +166,13 @@ export const auth = {
     apiFetch("/auth/password", { method: "POST", body: { current_password, new_password, confirm_new_password } }),
   logout: () => apiFetch("/auth/logout", { method: "POST" }),
   refresh: () => apiFetch("/auth/refresh", { method: "POST" }),
+  // Proactive background refresh (AuthContext's 5-minute timer). Deliberately
+  // bypasses apiFetch — a single transient failure here (a network blip, a
+  // brief backend restart, ...) must NOT force the whole app into
+  // signed-out view while the user is just idly reading. If the session is
+  // truly gone, that surfaces reactively the next time a real user action
+  // hits a 401 and apiFetch's own retry-with-refresh is exhausted.
+  silentRefresh: () => rawFetch("/auth/refresh", { method: "POST" }),
   googleStartUrl: (intent = "login") => `${BASE_URL}/auth/google/start?intent=${intent}`,
   unlinkGoogle: () => apiFetch("/auth/google/unlink", { method: "POST" }),
 };

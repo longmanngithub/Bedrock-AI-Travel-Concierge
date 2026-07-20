@@ -98,13 +98,17 @@ export function AuthProvider({ children }) {
   // Proactive silent refresh while a session is active — keeps the access
   // cookie perpetually valid so nothing (including the job-progress
   // EventSource, which has no retry hook of its own) ever actually hits the
-  // 10-minute wall during normal use. Errors are swallowed here; a refresh
-  // that genuinely fails still gets caught by apiFetch's own retry-on-401
-  // path the next time anything calls the API, which calls forceReauth.
+  // 10-minute wall during normal use. Uses silentRefresh (not refresh) and
+  // swallows all errors here: this is an optimistic background call, and a
+  // single transient failure (a network blip, a brief backend restart) must
+  // not force a visible logout while the user is just idly reading — a
+  // refresh that genuinely fails still gets caught by apiFetch's own
+  // retry-on-401 path the next time an actual user action hits the API,
+  // which calls forceReauth.
   useEffect(() => {
     if (!user) return;
     const id = setInterval(() => {
-      auth.refresh().catch(() => {});
+      auth.silentRefresh().catch(() => {});
     }, SILENT_REFRESH_INTERVAL_MS);
     return () => clearInterval(id);
   }, [user]);
