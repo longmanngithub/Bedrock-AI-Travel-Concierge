@@ -64,7 +64,6 @@ x-backend-env: &backend-env
 services:
   db:
     image: postgres:16-alpine
-    container_name: concierge-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-concierge}
@@ -79,10 +78,10 @@ services:
       retries: 5
     networks:
       - concierge_net
+      - dokploy-network
 
   redis:
     image: redis:7-alpine
-    container_name: concierge-redis
     restart: unless-stopped
     # Progress streams only (Postgres is the source of truth). Cap memory + evict
     # oldest so a burst of jobs can't OOM the box.
@@ -94,12 +93,12 @@ services:
       retries: 5
     networks:
       - concierge_net
+      - dokploy-network
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: concierge-backend
     restart: unless-stopped
     depends_on:
       db:
@@ -121,18 +120,20 @@ services:
     volumes:
       - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
       - concierge_avatars:/var/lib/bedrock/avatars
-    # Same-origin behind nginx in production: bind to localhost only so the API
-    # isn't directly exposed; nginx proxies /api/* to it. See DEPLOYMENT.md.
-    ports:
-      - "127.0.0.1:8000:8000"
+    # No host port binding: Traefik (managed by Dokploy) reaches this over
+    # dokploy-network, so nothing needs to be published on the host at all.
+    # If deploying with plain `docker compose` instead (no Dokploy/Traefik in
+    # front), add back `ports: ["127.0.0.1:8000:8000"]` here.
+    expose:
+      - "8000"
     networks:
       - concierge_net
+      - dokploy-network
 
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: concierge-worker
     restart: unless-stopped
     depends_on:
       db:
@@ -152,6 +153,7 @@ services:
     stop_grace_period: 60s
     networks:
       - concierge_net
+      - dokploy-network
 
   frontend:
     build:
@@ -160,18 +162,25 @@ services:
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL in .env}
         NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
-    container_name: concierge-frontend
     restart: unless-stopped
     depends_on:
       - backend
-    ports:
-      - "127.0.0.1:5173:5173"
+    expose:
+      - "5173"
     networks:
       - concierge_net
+      - dokploy-network
 
 networks:
   concierge_net:
     driver: bridge
+  # Created by Dokploy itself — declared external so this compose file doesn't
+  # try to create it. Traefik (Dokploy's reverse proxy) and every app it
+  # routes to share this network. Deploying with plain `docker compose`
+  # instead of Dokploy? Delete this network block and the `dokploy-network`
+  # line under each service's `networks:` above.
+  dokploy-network:
+    external: true
 
 volumes:
   concierge_pgdata:
