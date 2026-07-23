@@ -117,6 +117,16 @@ services:
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      # Trust X-Forwarded-* from the reverse proxy. uvicorn only honours these
+      # from `127.0.0.1` by default — true when nginx ran on the same host
+      # (DEPLOYMENT.md §7), false behind Traefik/Dokploy, where the proxy is a
+      # separate container with a bridge-network IP. Without this every request
+      # reports the proxy's IP as `request.client.host`, so slowapi's
+      # `get_remote_address` key (rate_limit.py) collapses ALL callers into one
+      # shared bucket — rate_limit_login (5/minute) and rate_limit_generate
+      # (20/minute) become global, not per-client. Safe to trust broadly here:
+      # this service publishes no host port, so the proxy is the only path in.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
     volumes:
       - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
       - concierge_avatars:/var/lib/bedrock/avatars
@@ -149,6 +159,12 @@ services:
     volumes:
       - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
     command: ["arq", "app.queue.worker.WorkerSettings"]
+    # The image's built-in HEALTHCHECK curls localhost:8000/health, which is
+    # only meaningful for the `backend` service (uvicorn) — the worker runs
+    # `arq`, never binds port 8000, and would show "unhealthy" forever
+    # otherwise despite functioning normally.
+    healthcheck:
+      disable: true
     # Give in-flight crew runs time to drain on a rolling deploy.
     stop_grace_period: 60s
     networks:
