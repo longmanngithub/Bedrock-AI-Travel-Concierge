@@ -45,6 +45,7 @@ from .conversation import (
     ChatRequest,
     ChatResponse,
     QuickReply,
+    build_follow_ups,
     build_reply_messages,
     extract_turn,
     latest_previous_record_id,
@@ -209,17 +210,10 @@ def _parse_uuid(value: str | None) -> uuid.UUID | None:
         return None
 
 
-_DEFAULT_FOLLOW_UPS = [
-    "Help me choose a destination",
-    "What should I pack?",
-    "Plan a weekend getaway",
-]
-
-
-def _follow_ups(extraction) -> list[dict[str, str]]:
-    options = [str(option).strip() for option in (extraction.quick_reply_options or []) if str(option).strip()]
-    options = options[:4] or _DEFAULT_FOLLOW_UPS
-    return [{"label": option, "value": option} for option in options]
+# Every quick-reply decision lives in conversation.py, next to the extraction
+# it depends on (see build_follow_ups' docstring); this is only the local alias
+# the route handlers below call.
+_follow_ups = build_follow_ups
 
 
 async def _persist_completed_reply(

@@ -53,6 +53,110 @@ _AFFIRMATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# An explicit imperative to APPLY something to the itinerary ("please add these
+# into the itinerary plan", "incorporate that into the itinerary", "update the
+# itinerary"). This is not a *speculative* ask — the traveller has already
+# spelled out that they want the plan changed — so it counts as its own
+# confirmation and must not be met with "shall I apply that?". Verified live
+# (screenshot in the issue report): a turn phrased exactly this way was sent
+# round the confirmation loop three separate times, and the model filled the
+# dead air by claiming it had already "tucked the changes into your itinerary"
+# — a hallucination caused directly by there being no way out of the loop.
+_APPLY_TARGET = r"(?:the\s+|my\s+|our\s+|this\s+)?(?:itinerary|plan|trip|schedule)"
+_APPLY_NOW_RE = re.compile(
+    r"\b(?:"
+    # "add / apply / incorporate / include / fold / put X in(to) the itinerary"
+    rf"(?:appl(?:y|ied)|incorporat(?:e|ed)|includ(?:e|ed)|add(?:ed)?|put|fold|insert)"
+    rf"\b[^.?!]{{0,80}}?\b(?:in|into|onto|to)\s+{_APPLY_TARGET}"
+    # "update / revise / rebuild the itinerary", "update it"
+    rf"|(?:updat(?:e|ing)|revis(?:e|ing)|rebuild|regenerate|redo|remake)\s+"
+    rf"(?:it\b|{_APPLY_TARGET})"
+    # bare "apply them / apply it now"
+    r"|appl(?:y|ies)\s+(?:them|it|those|these|that|all)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Confirmations that don't LEAD with a yes-word, so the start-anchored
+# `_AFFIRMATION_RE` can never see them. The live miss that motivated this:
+# "No, it is confirmed now" — a perfectly clear yes whose first word is "No"
+# (the traveller is answering "anything else first?" with no, then confirming).
+_CONFIRMED_ANYWHERE_RE = re.compile(
+    r"\b(?:"
+    r"confirm(?:ed|ing)?|go ahead|apply (?:it|them|those|that)|"
+    r"i'?m ready|ready to (?:go|apply|finaliz(?:e|ed))"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Negation guard for both patterns above: the negation must sit immediately
+# before the verb ("don't apply it yet", "it is not confirmed", "not yet
+# confirmed"). Deliberately requires whitespace after the negator so that "No,
+# it is confirmed now" — where the "No" answers a *different* question and a
+# new clause follows the comma — is not caught.
+_NEGATED_CONFIRM_RE = re.compile(
+    r"\b(?:do\s?n'?t|do not|does\s?n'?t|did\s?n'?t|wo\s?n'?t|ca\s?n'?t|cannot|"
+    r"is\s?n'?t|no|not|never)\s+"
+    # Only an explicit short list may sit between the negator and the verb —
+    # never a new clause. "it is" is absent on purpose, so "No, it is confirmed
+    # now" (a yes) stays out of reach of this guard.
+    r"(?:yet\s+|just\s+|really\s+|quite\s+|want\s+to\s+|wish\s+to\s+|"
+    r"need\s+to\s+|like\s+to\s+|going\s+to\s+|gonna\s+)*"
+    r"(?:appl(?:y|ied)|add|incorporate|includ(?:e)|updat(?:e)|chang(?:e)|"
+    r"confirm(?:ed)?|ready)\b",
+    re.IGNORECASE,
+)
+
+# An apply-now imperative is never an information-seeking question. "What would
+# you add to the itinerary?" is a request for *suggestions*, not permission to
+# rebuild. Only leading wh-words disqualify: "Could you add that to the
+# itinerary?" is a polite imperative and must still count as a confirmation.
+_WH_QUESTION_RE = re.compile(
+    r"^\s*(what|which|how|why|when|where|who|whose|whom)\b", re.IGNORECASE
+)
+
+# A clear "not yet" — only consulted when nothing above read as a confirmation,
+# so a message like "No, it is confirmed now" is never misclassified by it.
+_DECLINE_RE = re.compile(
+    r"^\s*(no|nope|nah|not yet|not now|wait|hold on|hold off|don'?t|do not|"
+    r"stop|cancel|later)\b",
+    re.IGNORECASE,
+)
+
+# How the assistant phrases its "shall I apply that?" offer. Counted across the
+# transcript purely to detect a STALLED confirmation loop — see the stall
+# breaker in extract_turn.
+_CONFIRM_OFFER_RE = re.compile(
+    r"(would you like|want me to|shall i|should i|let me know when|"
+    r"ready for me to|like me to)[^.?!]{0,90}"
+    r"(appl|add|fold|incorporat|updat|includ|tuck)",
+    re.IGNORECASE,
+)
+
+
+def _reads_as_confirmation(text: str) -> bool:
+    """Does this user message greenlight applying the pending change(s) now?
+
+    Three deliberately overlapping signals (leading affirmation, an explicit
+    apply-to-the-itinerary imperative, a confirmation stated mid-sentence).
+    Overlapping on purpose: a false positive costs one extra crew run, while a
+    false negative strands the traveller in a confirmation loop with no exit —
+    the exact failure this function exists to end.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _NEGATED_CONFIRM_RE.search(stripped):
+        return False
+    if _AFFIRMATION_RE.match(stripped):
+        return True
+    if _WH_QUESTION_RE.match(stripped):
+        # Asking what/how/which — seeking information, not granting a go-ahead.
+        return False
+    return bool(
+        _APPLY_NOW_RE.search(stripped) or _CONFIRMED_ANYWHERE_RE.search(stripped)
+    )
+
 
 # ---------------------------------------------------------------------------
 # Chat wire schema
@@ -347,9 +451,22 @@ Field notes:
       always, no confirmation needed for a brand-new trip; or
   (b) an itinerary was already built (look for the "[Itinerary already
       built for the traveller — ...]" marker) AND the traveller's LATEST
-      message is a clear, explicit AFFIRMATIVE reply confirming they want the
+      message either (i) is a clear AFFIRMATIVE reply confirming they want the
       pending changes applied now — "yes", "yeah", "go ahead", "do it",
-      "please update it", "sounds good", "update it now", "let's do it", etc.
+      "please update it", "sounds good", "update it now", "let's do it",
+      "it's confirmed", "I'm ready to apply them", etc. — or (ii) is itself an
+      explicit instruction to APPLY something to the itinerary: "add these to
+      the itinerary", "please incorporate that into the plan", "put that in my
+      itinerary", "update the itinerary with that". Case (ii) IS the
+      confirmation; it is not a request that needs one. Do NOT answer an
+      apply-now instruction with "shall I apply that?" — the traveller has
+      already told you to, and asking again is the single most frustrating
+      thing you can do here.
+      Read (i) generously: a confirmation does not have to be the first word of
+      the message, and does not have to be the word "yes". "No, it's confirmed
+      now" is a YES (they're declining to add anything else, then confirming).
+      A message that contains a clear confirmation anywhere in it counts,
+      unless it is explicitly negated ("not confirmed", "don't apply it yet").
       When this is true, "special_requests" must carry the FULL aggregate of
       everything pending (per the rule above), not just an empty
       acknowledgement — the planning system uses it to know what to change.
@@ -357,9 +474,9 @@ Field notes:
   stay false, even when the traveller is clearly asking for a real, concrete
   change — replanning is comparatively expensive (a full multi-agent run), so
   never trigger it speculatively. Concretely:
-    1. CONCRETE, actionable request, not yet confirmed — "add hotel
-       recommendations", "add a day trip to Porto", "swap day 3's dinner",
-       "increase travelers to 2" — add it to "special_requests" (aggregated
+    1. CONCRETE, actionable request that does NOT already tell you to apply it
+       — "I'd love some hotel recommendations", "day 3 feels heavy", "we're 2
+       travellers now" — add it to "special_requests" (aggregated
        with anything else already pending) and ask, in "assistant_reply",
        whether they'd like it applied now (e.g. "Want me to fold that into
        your itinerary now, or is there anything else you'd like to add
@@ -373,6 +490,19 @@ Field notes:
        You also have no way to actually search flights/prices from this chat
        turn — never claim you're "searching" or "found" fares here; that only
        happens once the itinerary is actually (re)built.
+       Ask AT MOST ONCE. If you look back and see that you already asked
+       whether to apply a pending change, and the traveller has replied
+       anything other than a clear "not yet", do not ask a third time — treat
+       their reply as the confirmation and set ready_to_plan true. Repeating
+       the question is worse than acting on a slightly ambiguous yes.
+       NEVER claim, in any wording, that a pending change has been recorded,
+       noted, saved, "tucked into", or will be included — and never say you'll
+       apply it "when they're ready" as if it were queued up somewhere.
+       Nothing is stored between turns: if ready_to_plan is false, the change
+       does not exist yet anywhere, and saying otherwise is a straightforward
+       falsehood the traveller will later discover in an unchanged itinerary.
+       Say only what is true: you can rebuild the itinerary with that change,
+       and you need their go-ahead to do it.
     2. VAGUE request with no specifics — "make it better", "I don't love
        day 3", "can you improve this" — these express a desire for change but
        don't say WHAT to change. Leave "special_requests" unchanged (don't
@@ -440,6 +570,23 @@ Field notes:
   BAD: budget chips when asking about destination, or vice-versa — WRONG SLOT.
   Use [] only when ready_to_plan is true. Base ONLY on the slot you are asking
   about THIS turn — never reuse chips from an earlier turn.
+
+  Once every required slot is known (nothing left in "missing_required"), chips
+  stop being slot answers and become suggested NEXT MESSAGES, so the rules
+  change:
+    - If your reply asks whether to apply a pending change (case 1 above), the
+      chips must answer THAT question and nothing else — e.g. ["Yes, apply it
+      now","I'd like to add something else","Not yet"], slot "other". Never
+      offer an unrelated suggestion here; a tap on one would leave your own
+      question unanswered and stall the confirmation another turn.
+    - If an itinerary already exists and nothing is pending, suggest realistic
+      follow-ups for someone who ALREADY HAS a plan — ["Adjust this
+      itinerary","Add food recommendations","What should I pack?"], slot
+      "other". Never suggest choosing a destination, picking dates, or setting
+      a budget: those are settled, and offering them reads as if you forgot the
+      trip you just planned.
+    - If you genuinely have nothing useful to suggest, return [] rather than
+      padding the row with a chip that doesn't fit the conversation.
 
 CRITICAL RULES:
 - Never use emoji or emoticons anywhere in "assistant_reply" — not even one.
@@ -622,7 +769,12 @@ def build_reply_messages(messages: list[ChatTurn], extraction: ExtractionResult)
             f"ask whether they'd like it applied to the itinerary now, or "
             f"whether they want to add anything else first. Do not say you're "
             f"already updating it — you're only offering to, pending their "
-            f"yes.\n"
+            f"yes. Equally, do NOT say the change has been noted, saved, "
+            f"written down, 'tucked in', or that you'll make sure it's "
+            f"included later: nothing is stored between turns, so any such "
+            f"promise is false and the traveller will find the itinerary "
+            f"unchanged. Say only that you can rebuild it with that change and "
+            f"need their go-ahead.\n"
             "  - If they're vaguely asking for SOME change without saying what "
             "(e.g. 'make it better', 'I don't love day 3', 'can you improve "
             "this') — don't guess and don't just acknowledge vaguely. Ask ONE "
@@ -667,6 +819,24 @@ def build_reply_messages(messages: list[ChatTurn], extraction: ExtractionResult)
 def _itinerary_already_exists(messages: list[ChatTurn]) -> bool:
     """Has a prior assistant turn already built and marked an itinerary?"""
     return any(m.role == "assistant" and "[Itinerary already built" in m.content for m in messages)
+
+
+def _confirmation_offer_count(messages: list[ChatTurn]) -> int:
+    """How many times has the assistant offered to apply pending changes since
+    the itinerary was built? Feeds the stall breaker in extract_turn — two or
+    more offers with no decline in between means the confirmation handshake has
+    gone circular and should be resolved by acting, not by asking again."""
+    count = 0
+    seen_marker = False
+    for m in messages:
+        if m.role != "assistant":
+            continue
+        if "[Itinerary already built" in m.content:
+            seen_marker = True
+            continue
+        if seen_marker and _CONFIRM_OFFER_RE.search(m.content):
+            count += 1
+    return count
 
 
 _RECORD_ID_RE = re.compile(r"record_id:\s*(\d+)")
@@ -774,7 +944,25 @@ _FIELD_TO_CANONICAL = {
 }
 
 
-def _validate_quick_replies(result: ExtractionResult) -> list[str]:
+# Chips for a turn where a concrete change is pending the traveller's yes. The
+# reply IS a yes/no question, so offering anything else (a packing question, a
+# new destination) is a non-answer that reads as the assistant ignoring its own
+# question — and tapping one stalls the confirmation another turn. Deterministic
+# rather than model-generated because the answer space here is closed.
+_CONFIRM_CHIPS = ["Yes, apply it now", "I'd like to add something else", "Not yet"]
+
+# Fallback chips once an itinerary exists and nothing is pending. Follow-ups a
+# traveller who ALREADY has a plan would plausibly send — unlike the global
+# fallback in main.py, which suggests choosing a destination to someone holding
+# a finished Barcelona itinerary.
+_POST_ITINERARY_CHIPS = [
+    "Adjust this itinerary",
+    "Add food recommendations",
+    "What should I pack?",
+]
+
+
+def _validate_quick_replies(result: ExtractionResult, messages: list[ChatTurn]) -> list[str]:
     """Filter the LLM's quick_reply_options to keep only the right slot.
 
     The LLM often mixes chips from different slots (e.g. date + budget in one
@@ -790,9 +978,39 @@ def _validate_quick_replies(result: ExtractionResult) -> list[str]:
     if result.ready_to_plan:
         return []
 
-    # No missing slots → conversational follow-up; keep whatever the LLM gave.
     if not result.missing_required:
-        return result.quick_reply_options
+        # No missing slots → a conversational follow-up. This branch used to
+        # return the model's chips completely unvalidated, which is where the
+        # off-context rows came from: chips answering a slot that is already
+        # settled (dates, budget) or generic "help me pick a destination"
+        # suggestions offered to someone whose itinerary is already built.
+        pending = bool((result.slots.special_requests or "").strip())
+        itinerary_exists = _itinerary_already_exists(messages)
+
+        # A pending confirmation is a closed yes/no question — answer chips for
+        # anything else make the traveller's next tap ambiguous about which
+        # question it replies to (the same reasoning as the prompt's "keep the
+        # confirmation reply narrowly focused" rule).
+        if itinerary_exists and pending:
+            return list(_CONFIRM_CHIPS)
+
+        # Drop chips that answer a slot the traveller has already settled —
+        # re-offering "Around $3,000" or "Next month" after both are known is
+        # the most common way the row goes stale.
+        settled = {
+            "budget": result.slots.budget is not None,
+            "dates": bool(result.slots.start_date and result.slots.end_date),
+            "pace": bool(result.slots.pace),
+            "travelers": result.slots.travelers is not None,
+        }
+        kept = [
+            opt
+            for opt in result.quick_reply_options
+            if not settled.get(_detect_slot(opt) or "", False)
+        ]
+        if kept:
+            return kept
+        return list(_POST_ITINERARY_CHIPS) if itinerary_exists else []
 
     # Determine the primary slot (first in priority order that is missing).
     primary = next(
@@ -819,6 +1037,40 @@ def _validate_quick_replies(result: ExtractionResult) -> list[str]:
 
     # Filtering removed everything — fall back to defaults.
     return _SLOT_DEFAULTS.get(primary, [])
+
+
+# Cold-start suggestions for a traveller who hasn't told us anything about a
+# trip yet. Deliberately NOT a universal fallback — see build_follow_ups.
+DEFAULT_FOLLOW_UPS = [
+    "Help me choose a destination",
+    "What should I pack?",
+    "Plan a weekend getaway",
+]
+
+
+def build_follow_ups(extraction: ExtractionResult) -> list[dict[str, str]]:
+    """Shape a settled turn's chips into the `{label, value}` wire format.
+
+    `extraction.quick_reply_options` has already been made context-aware by
+    `_validate_quick_replies` (right slot, no settled slots, confirmation chips
+    when a change is pending) — including a deliberate empty list when nothing
+    sensible applies. So `DEFAULT_FOLLOW_UPS` is a cold-start fallback ONLY: it
+    suggests choosing a destination and planning a weekend getaway, which is
+    actively wrong for a traveller who has already told us where and when
+    they're going. Substituting it over an intentional empty list was the other
+    source of chip rows that didn't match the conversation.
+    """
+    options = [
+        str(option).strip()
+        for option in (extraction.quick_reply_options or [])
+        if str(option).strip()
+    ]
+    if options:
+        return [{"label": option, "value": option} for option in options[:4]]
+    slots = extraction.slots
+    if slots.destination or slots.start_date or slots.budget:
+        return []
+    return [{"label": option, "value": option} for option in DEFAULT_FOLLOW_UPS]
 
 
 def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> ExtractionResult:
@@ -958,21 +1210,47 @@ def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> 
     # every concrete follow-up would trigger an unconfirmed ~1-2 minute crew
     # replan — precisely the token-burning behavior this feature exists to
     # avoid.
-    if result.ready_to_plan and _itinerary_already_exists(messages):
+    #
+    # This gate is BIDIRECTIONAL, and that matters. It used to only ever
+    # downgrade, which left the model's `false` unappealable: if the model
+    # decided not to replan on a turn where the traveller had plainly said yes,
+    # no code could overrule it, so the turn came back as another "shall I
+    # apply that?" — forever. Verified live (see the issue screenshot): three
+    # consecutive confirmations ("No, it is confirmed now", "I'm ready to apply
+    # them", "Please, incorporate that into the itinerary") were each answered
+    # with a fresh confirmation request, and by the third the model had started
+    # asserting it had already applied the changes. A model `false` is now
+    # overruled under exactly the same evidence the `true` case demands.
+    if _itinerary_already_exists(messages):
         has_something_concrete = bool((result.slots.special_requests or "").strip())
         last_user_text = next(
             (m.content for m in reversed(messages) if m.role == "user"), ""
         )
-        confirmed = bool(_AFFIRMATION_RE.match(last_user_text.strip()))
-        if not (has_something_concrete and confirmed):
-            result.ready_to_plan = False
+        confirmed = _reads_as_confirmation(last_user_text)
+        if result.ready_to_plan:
+            if not (has_something_concrete and confirmed):
+                result.ready_to_plan = False
+        elif has_something_concrete and confirmed and not still_missing:
+            result.ready_to_plan = True
+            result.missing_required = []
+        elif has_something_concrete and not still_missing:
+            # Stall breaker (last resort). Something concrete is pending and
+            # the assistant has now offered to apply it more than once without
+            # the traveller ever declining — whatever they said, it wasn't a
+            # "not yet", so asking a third time is strictly worse than acting.
+            # Only counts offers made AFTER the itinerary was built, so a
+            # pre-plan clarifying question can't trip it.
+            declined = bool(_DECLINE_RE.match(last_user_text.strip()))
+            if not declined and _confirmation_offer_count(messages) >= 2:
+                result.ready_to_plan = True
+                result.missing_required = []
 
     # --- Quick-reply context-awareness backstop ---
     # The LLM occasionally returns chips for the wrong slot (e.g. budget
     # chips when the question is about destination).  Determine the correct
     # primary slot from the code-side missing list and swap in defaults
     # whenever there's a mismatch.
-    result.quick_reply_options = _validate_quick_replies(result)
+    result.quick_reply_options = _validate_quick_replies(result, messages)
 
     # LLM routing: derived LAST, from the now-authoritative on_topic /
     # ready_to_plan (after every backstop above has run), so it never disturbs
