@@ -8,6 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Absolute path to the `backend/` directory, used for the .env file and the
@@ -74,8 +75,26 @@ class Settings(BaseSettings):
     # Application Default Credentials (gcloud auth application-default login);
     # no API key. Billed to the project's Cloud account (e.g. $300 free trial),
     # and NOT subject to the Developer-API free-tier 15 req/min limit.
-    vertex_project: str | None = None
-    vertex_location: str = "us-central1"
+    # NOTE the explicit aliases. These fields are named `vertex_*`, so
+    # pydantic-settings would bind them to VERTEX_PROJECT / VERTEX_LOCATION —
+    # but the name documented everywhere (.env.example, README, DEPLOYMENT.md)
+    # and understood by LiteLLM itself is VERTEXAI_*. Without the alias the
+    # .env values silently never bound: `vertex_project` stayed None, so
+    # `_ensure_provider_env` never exported anything and `build_llm` never
+    # passed the project/location kwargs. LiteLLM then fell back to ADC's
+    # default project and its own default region, producing a 404 for a model
+    # that only exists in the configured project/location. Deployed
+    # environments were unaffected — there the VERTEXAI_* names are real
+    # process env vars, which LiteLLM reads directly, bypassing Settings — so
+    # this only ever broke local runs, which is why it went unnoticed.
+    vertex_project: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VERTEXAI_PROJECT", "VERTEX_PROJECT"),
+    )
+    vertex_location: str = Field(
+        default="us-central1",
+        validation_alias=AliasChoices("VERTEXAI_LOCATION", "VERTEX_LOCATION"),
+    )
 
     # --- Database ---
     database_url: str = (

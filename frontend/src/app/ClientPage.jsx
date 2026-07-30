@@ -263,7 +263,7 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
           }}
         />
         <div
-          className={`absolute inset-y-0 left-0 w-[86%] max-w-[320px] shadow-2xl transition-transform duration-200 ease-out ${
+          className={`absolute inset-y-0 left-0 w-[86%] max-w-[320px] isolate overflow-hidden rounded-r-[28px] bg-surface shadow-2xl transition-transform duration-200 ease-out ${
             drawerOpen ? "translate-x-0" : "-translate-x-full"
           }`}
         >
@@ -277,11 +277,16 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
         <header className="flex items-center gap-3 border-b border-line px-4 py-3 md:hidden">
           <button
             type="button"
+            // `onClick` only. A previous `onTouchStart` handler here made the
+            // drawer open and then instantly shut again on every tap: React
+            // attaches touchstart at the root as a PASSIVE listener, so its
+            // `preventDefault()` was a no-op (that's the "Unable to
+            // preventDefault inside passive event listener" console error).
+            // With the default not prevented, the browser still synthesised the
+            // follow-up click — but by then this handler had already opened the
+            // drawer, so the scrim was mounted and interactive under the
+            // pointer, and the click landed on it and closed the drawer again.
             onClick={() => setDrawerOpen(true)}
-            onTouchStart={(e) => {
-              e.preventDefault();
-              setDrawerOpen(true);
-            }}
             aria-label="Open menu"
             className="flex h-11 w-11 items-center justify-center rounded-full text-ink-soft hover:bg-surface-2"
           >

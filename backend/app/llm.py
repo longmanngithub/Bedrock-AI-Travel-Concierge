@@ -40,6 +40,43 @@ def _export_provider_keys() -> None:
         os.environ.setdefault("GOOGLE_CLOUD_LOCATION", settings.vertex_location)
 
 
+def _vertex_quota_headers() -> dict[str, str]:
+    """The `x-goog-user-project` header Vertex needs under *user* credentials.
+
+    Google requires a billing/quota project on every Vertex call made with an
+    `authorized_user` credential — what `gcloud auth application-default login`
+    produces, and what DEPLOYMENT.md tells developers to use locally. The
+    google-auth transport normally attaches it from the credential's own
+    `quota_project_id`, but LiteLLM's Gemini path builds its request by hand
+    with a bare `Authorization: Bearer` token and only ever sets this header on
+    its text-to-speech route — so the header is dropped and every
+    `generateContent` call comes back 404 ("not found or your project does not
+    have access to it"), regardless of the model id. Verified against the raw
+    REST endpoint: identical request, 404 without the header and 200 with it.
+
+    Deliberately scoped to user credentials. A service-account credential (how
+    deployed environments authenticate) needs no quota project, and sending one
+    would newly require `serviceusage.services.use` on that project — so
+    passing it unconditionally could break a working deployment. Returns {} on
+    anything that isn't a user credential, including when google-auth or ADC is
+    unavailable.
+    """
+    settings = get_settings()
+    if not settings.vertex_project:
+        return {}
+    try:
+        import google.auth
+
+        credentials, _ = google.auth.default()
+    except Exception:  # noqa: BLE001 - no ADC configured; nothing to add
+        return {}
+    # google.oauth2.credentials.Credentials is the user ("authorized_user")
+    # flavour; service accounts are a different class entirely.
+    if type(credentials).__module__.startswith("google.oauth2.credentials"):
+        return {"x-goog-user-project": settings.vertex_project}
+    return {}
+
+
 def build_llm(model: str | None = None, temperature: float = 0.4, *, task: str | None = None) -> LLM:
     """Return a CrewAI LLM for the given (or default) model id.
 
@@ -70,6 +107,10 @@ def build_llm(model: str | None = None, temperature: float = 0.4, *, task: str |
         kwargs["timeout"] = settings.request_timeout
     if settings.llm_num_retries:
         kwargs["additional_params"] = {"num_retries": settings.llm_num_retries}
+    if (kwargs["model"] or "").startswith("vertex_ai/"):
+        quota_headers = _vertex_quota_headers()
+        if quota_headers:
+            kwargs["extra_headers"] = quota_headers
     return LLM(**kwargs)
 
 
@@ -119,6 +160,9 @@ def stream_call(
         if settings.vertex_project and model.startswith("vertex_ai/"):
             kwargs["vertex_project"] = settings.vertex_project
             kwargs["vertex_location"] = settings.vertex_location
+            quota_headers = _vertex_quota_headers()
+            if quota_headers:
+                kwargs["extra_headers"] = quota_headers
         for chunk in litellm.completion(**kwargs):
             try:
                 delta = chunk.choices[0].delta.content

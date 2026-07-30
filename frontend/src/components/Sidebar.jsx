@@ -154,7 +154,17 @@ export default function Sidebar({
   const initialCount = initialConversationCount ?? 3;
 
   return (
-    <aside className="relative flex h-full w-full flex-col bg-surface rounded-r-[28px] md:w-[300px] md:rounded-[28px] md:shadow-[0_2px_20px_rgba(30,30,60,0.06)]">
+    // `overflow-hidden` clips every child to the panel's rounded corners. The
+    // fade layer below is opaque `--color-surface` along its bottom edge, and
+    // relying on that layer's own border-radius to keep it inside the curve is
+    // not enough in practice: WebKit is known to drop a border-radius clip when
+    // an ancestor is transformed, and the mobile drawer animates `translate`.
+    // The symptom is a white square poking out past the rounded bottom-right
+    // corner. Clipping here as well means one of the two has to hold.
+    // Safe for the account menu: it is `absolute bottom-full left-0 w-full`
+    // (see AuthControls' AccountMenu), so it opens upward *inside* this panel
+    // and never crosses its edges.
+    <aside className="relative flex h-full w-full flex-col overflow-hidden bg-surface rounded-r-[28px] md:w-[300px] md:rounded-[28px] md:shadow-[0_2px_20px_rgba(30,30,60,0.06)]">
       {/* Brand */}
       <div className="flex items-center gap-2.5 px-5 pt-6 pb-5">
         <Logo size={30} />
@@ -247,19 +257,30 @@ export default function Sidebar({
         )}
       </nav>
 
-      {/* The profile control floats above the conversation scroller. A
-          transparent, masked backdrop blur preserves the hierarchy while
-          allowing the scrolled content to remain visible behind it. */}
+      {/* The profile control floats above the conversation scroller, with a
+          fade beneath it so list items dissolve into the panel as they scroll
+          under the account row instead of being clipped mid-row.
+
+          The fade is a gradient in the panel's OWN surface colour, not a
+          backdrop-filter. This panel's background is fully opaque (--color-surface
+          is #ffffff / #0e201f, no alpha), so a blur here could never reveal
+          anything through it — the only thing it could do was sample the page
+          *outside* the panel and, because the layer spans the full width, smear
+          those foreign pixels into the rounded bottom-right corner as a pale
+          haze. It also forced the blur to re-rasterise every frame while the
+          mobile drawer slides (the parent animates `transition-transform`),
+          which made the open/close animation stutter. A gradient produces the
+          same dissolve with no sampling and no per-frame work. (The Composer's
+          backdrop blur is different and stays: it sits over a translucent
+          canvas, so there is genuinely something behind it to frost.) */}
       <div ref={footerRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-10">
         <div className="pointer-events-auto relative px-3 pb-3 pt-8">
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-28"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-28 rounded-br-[28px] md:rounded-b-[28px]"
             style={{
-              WebkitBackdropFilter: "blur(8px)",
-              backdropFilter: "blur(8px)",
-              WebkitMaskImage: "linear-gradient(to top, rgba(0,0,0,1) 45%, rgba(0,0,0,0) 100%)",
-              maskImage: "linear-gradient(to top, rgba(0,0,0,1) 45%, rgba(0,0,0,0) 100%)",
+              background:
+                "linear-gradient(to top, var(--color-surface) 45%, transparent 100%)",
             }}
           />
           <div className="relative">
