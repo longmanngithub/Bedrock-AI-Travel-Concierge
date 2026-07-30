@@ -93,6 +93,34 @@ class ConfirmationPhrasingTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(_reads_as_confirmation(text))
 
+    def test_accepts_finalize_phrasings(self) -> None:
+        """Reported from live use on the deployed build: "No, please finalize
+        the itinerary for me" is a yes, but it leads with "No" (answering
+        "anything else?"), so only a searched-anywhere pattern can catch it."""
+        for text in (
+            "No, please finalize the itinerary for me",
+            "please finalize the itinerary",
+            "finalize it",
+            "finalize the itinerary for me",
+            "go ahead and finalize",
+            "lock it in",
+            "make it final",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_reads_as_confirmation(text))
+
+    def test_rejects_finalize_questions_and_negations(self) -> None:
+        for text in (
+            "how do I finalize it?",
+            "when should I finalize the itinerary?",
+            "is the itinerary final?",
+            "don't finalize it yet",
+            "not ready to finalize",
+            "I do not want to finalize the itinerary yet",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(_reads_as_confirmation(text))
+
     def test_rejects_negated_apply_instructions(self) -> None:
         """The imperative patterns are broad by design, so negation and
         question forms are what keep them from over-firing."""
@@ -219,6 +247,63 @@ class ReplanGateTests(unittest.TestCase):
             self._payload(ready=False, special="add packing suggestions"), messages
         )
         self.assertFalse(result.ready_to_plan)
+
+    def test_model_true_with_dropped_special_requests_still_replans(self) -> None:
+        """The ordering trap. A model `true` with special_requests=None used to
+        take the downgrade branch, and the branches that would have re-approved
+        it were elifs that never ran — so a plain "Yes, go ahead" answering an
+        offer fell through to another confirmation request."""
+        messages = turns(
+            ("user", "5 days in Barcelona for 2"),
+            ("assistant", f"Here you go! {MARKER}"),
+            ("user", "Add this to the itinerary"),
+            ("assistant", OFFER),
+            ("user", "No, please finalize the itinerary for me"),
+            ("assistant", "Wonderful! I'll finalize that itinerary for you."),
+            ("user", "Yes, go ahead"),
+        )
+        result = run_extract(self._payload(ready=True, special=None), messages)
+        self.assertTrue(result.ready_to_plan)
+
+    def test_confirmation_answering_an_offer_replans_without_special_requests(self) -> None:
+        """An offer is only ever made about a concrete request, so it is
+        independent evidence something was pending."""
+        messages = turns(
+            ("user", "5 days in Barcelona for 2"),
+            ("assistant", f"Here you go! {MARKER}"),
+            ("user", "Add this to the itinerary"),
+            ("assistant", OFFER),
+            ("user", "No, please finalize the itinerary for me"),
+        )
+        result = run_extract(self._payload(ready=False, special=None), messages)
+        self.assertTrue(result.ready_to_plan)
+
+    def test_bare_confirmation_with_nothing_pending_does_not_replan(self) -> None:
+        """No pending request and no offer ever made — a stray "yes" must not
+        trigger a ~90s crew run."""
+        messages = turns(
+            ("user", "5 days in Barcelona for 2"),
+            ("assistant", f"Here you go! {MARKER}"),
+            ("user", "Is the Gothic Quarter safe at night?"),
+            ("assistant", "Generally yes, watch for pickpockets."),
+            ("user", "yes"),
+        )
+        result = run_extract(self._payload(ready=False, special=None), messages)
+        self.assertFalse(result.ready_to_plan)
+
+    def test_offer_regex_matches_the_products_real_phrasings(self) -> None:
+        """Written against wording the app actually emits — the original
+        pattern missed its own most common offer, leaving the stall breaker
+        disarmed on real transcripts."""
+        for text in (
+            OFFER,
+            "is there anything else you'd like to add or adjust before we finalize it?",
+            "Would you like me to fold that into your itinerary now?",
+            "Wonderful! I'll finalize that San Francisco itinerary for you.",
+            "I'll make sure those are added to your plan.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(conv._CONFIRM_OFFER_RE.search(text))
 
     def test_first_plan_needs_no_confirmation(self) -> None:
         """No itinerary yet → the gate must not touch a legitimate first plan."""
