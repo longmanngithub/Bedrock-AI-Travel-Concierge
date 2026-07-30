@@ -68,9 +68,14 @@ _APPLY_NOW_RE = re.compile(
     # "add / apply / incorporate / include / fold / put X in(to) the itinerary"
     rf"(?:appl(?:y|ied)|incorporat(?:e|ed)|includ(?:e|ed)|add(?:ed)?|put|fold|insert)"
     rf"\b[^.?!]{{0,80}}?\b(?:in|into|onto|to)\s+{_APPLY_TARGET}"
-    # "update / revise / rebuild the itinerary", "update it"
-    rf"|(?:updat(?:e|ing)|revis(?:e|ing)|rebuild|regenerate|redo|remake)\s+"
-    rf"(?:it\b|{_APPLY_TARGET})"
+    # "update / revise / rebuild / finalize the itinerary", "finalize it"
+    # `finaliz` matters more than it looks: "No, please finalize the itinerary
+    # for me" is a yes, but it leads with "No" (answering "anything else?"), so
+    # the start-anchored _AFFIRMATION_RE can't see it and this searched-anywhere
+    # pattern is the only thing that can. Same shape as the "No, it is confirmed
+    # now" miss — both were reported from live use.
+    rf"|(?:updat(?:e|ing)|revis(?:e|ing)|finaliz(?:e|ing)|rebuild|regenerate"
+    rf"|redo|remake)\s+(?:it\b|{_APPLY_TARGET})"
     # bare "apply them / apply it now"
     r"|appl(?:y|ies)\s+(?:them|it|those|these|that|all)\b"
     r")",
@@ -84,7 +89,8 @@ _APPLY_NOW_RE = re.compile(
 _CONFIRMED_ANYWHERE_RE = re.compile(
     r"\b(?:"
     r"confirm(?:ed|ing)?|go ahead|apply (?:it|them|those|that)|"
-    r"i'?m ready|ready to (?:go|apply|finaliz(?:e|ed))"
+    r"i'?m ready|ready to (?:go|apply|finaliz(?:e|ed))|"
+    r"lock (?:it|this|that) in|make (?:it|this|that) final"
     r")\b",
     re.IGNORECASE,
 )
@@ -103,7 +109,7 @@ _NEGATED_CONFIRM_RE = re.compile(
     r"(?:yet\s+|just\s+|really\s+|quite\s+|want\s+to\s+|wish\s+to\s+|"
     r"need\s+to\s+|like\s+to\s+|going\s+to\s+|gonna\s+)*"
     r"(?:appl(?:y|ied)|add|incorporate|includ(?:e)|updat(?:e)|chang(?:e)|"
-    r"confirm(?:ed)?|ready)\b",
+    r"finaliz(?:e|ed)|lock|confirm(?:ed)?|ready)\b",
     re.IGNORECASE,
 )
 
@@ -126,10 +132,29 @@ _DECLINE_RE = re.compile(
 # How the assistant phrases its "shall I apply that?" offer. Counted across the
 # transcript purely to detect a STALLED confirmation loop — see the stall
 # breaker in extract_turn.
+#
+# The second branch matters as much as the first. When the model has lost track
+# of what is pending it stops asking and starts asserting ("I'll finalize that
+# itinerary for you"), which is the hallucination this gate exists to prevent —
+# so a bare promise is evidence the loop is spinning, exactly like an offer.
+#
+# Both branches are written against wording this app actually produces. The
+# original pattern missed the product's own most common offer — "is there
+# anything else you'd like to add or adjust before we finalize it?" — which left
+# the stall breaker permanently disarmed on real transcripts (observed live:
+# offer_count 0 on a transcript containing that exact sentence).
 _CONFIRM_OFFER_RE = re.compile(
-    r"(would you like|want me to|shall i|should i|let me know when|"
-    r"ready for me to|like me to)[^.?!]{0,90}"
-    r"(appl|add|fold|incorporat|updat|includ|tuck)",
+    r"(?:"
+    # offering: "would you like me to add...", "anything else ... add or adjust"
+    r"(?:would you like|want me to|shall i|should i|let me know when|"
+    r"ready for me to|like me to|anything else)"
+    r"[^.?!]{0,90}"
+    r"(?:appl|add|fold|incorporat|updat|includ|tuck|finaliz|adjust)"
+    r"|"
+    # promising: "I'll finalize that itinerary", "I'll make sure those are added"
+    r"(?:i'?ll|i will|i'?m going to|let me)\s+[^.?!]{0,45}?"
+    r"(?:appl|add|fold|incorporat|updat|includ|tuck|finaliz)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -1221,29 +1246,53 @@ def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> 
     # with a fresh confirmation request, and by the third the model had started
     # asserting it had already applied the changes. A model `false` is now
     # overruled under exactly the same evidence the `true` case demands.
+    # For an existing itinerary the decision is computed here from scratch and
+    # the model's own `ready_to_plan` is not consulted at all. It was previously
+    # the starting point, which created an ordering trap: a model `true` with a
+    # dropped `special_requests` took the downgrade branch, and the branches
+    # that would have re-approved it were `elif`s that then never ran. That is
+    # a third distinct way the same loop reappeared (observed live on "Yes, go
+    # ahead"), so the branch order is gone rather than patched again.
     if _itinerary_already_exists(messages):
         has_something_concrete = bool((result.slots.special_requests or "").strip())
         last_user_text = next(
             (m.content for m in reversed(messages) if m.role == "user"), ""
         )
         confirmed = _reads_as_confirmation(last_user_text)
-        if result.ready_to_plan:
-            if not (has_something_concrete and confirmed):
-                result.ready_to_plan = False
-        elif has_something_concrete and confirmed and not still_missing:
-            result.ready_to_plan = True
+        declined = bool(_DECLINE_RE.match(last_user_text.strip()))
+        offers = _confirmation_offer_count(messages)
+
+        if still_missing:
+            replan = False
+        elif confirmed and (has_something_concrete or offers >= 1):
+            # The traveller said yes. Normally `special_requests` carries what
+            # they are saying yes TO, but the model does not always still report
+            # it at confirmation time — observed live on the transcript from the
+            # issue report, where it answered "No, please finalize the itinerary
+            # for me" with special_requests=None because it had decided the trip
+            # was already wrapped up. An assistant offer since the itinerary was
+            # built is independent evidence that something WAS pending (an offer
+            # is only ever made about a concrete request), so a yes answering it
+            # is a real go-ahead even when the model's bookkeeping has dropped
+            # it. Refusing here is what produced the endless loop.
+            replan = True
+        elif has_something_concrete and not declined and offers >= 2:
+            # Stall breaker (last resort). Something concrete is pending and the
+            # assistant has now raised it more than once without the traveller
+            # ever declining — whatever they said, it wasn't a "not yet", so
+            # asking again is strictly worse than acting. Only counts turns
+            # after the itinerary was built, so a pre-plan clarifying question
+            # can't trip it.
+            replan = True
+        else:
+            # Everything else stays conversational. In particular an unconfirmed
+            # concrete request still waits for a yes — replanning speculatively
+            # is a ~90s crew run the traveller didn't ask for.
+            replan = False
+
+        result.ready_to_plan = replan
+        if replan:
             result.missing_required = []
-        elif has_something_concrete and not still_missing:
-            # Stall breaker (last resort). Something concrete is pending and
-            # the assistant has now offered to apply it more than once without
-            # the traveller ever declining — whatever they said, it wasn't a
-            # "not yet", so asking a third time is strictly worse than acting.
-            # Only counts offers made AFTER the itinerary was built, so a
-            # pre-plan clarifying question can't trip it.
-            declined = bool(_DECLINE_RE.match(last_user_text.strip()))
-            if not declined and _confirmation_offer_count(messages) >= 2:
-                result.ready_to_plan = True
-                result.missing_required = []
 
     # --- Quick-reply context-awareness backstop ---
     # The LLM occasionally returns chips for the wrong slot (e.g. budget
