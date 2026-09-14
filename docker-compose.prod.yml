@@ -1,23 +1,6 @@
-# Production stack for a DigitalOcean droplet (or any single-host Docker
-# deployment). Local dev keeps using docker-compose.yml (Postgres + Redis) with
-# `uvicorn --reload` / `npm run dev` — this file containerizes everything.
-#
-# Usage (from the repo root, after copying .env.example -> .env and filling
-# in real values — see DEPLOYMENT.md):
-#
-#   docker compose -f docker-compose.prod.yml up -d --build
-#
-# The crew runs in the `worker` service (background), NOT in the request path.
-# Recommended droplet size: 4 GB RAM — the worker holds torch + Chroma + the
-# embedding model (~1.2 GB) plus a per-kickoff delta; 2 GB will OOM under load.
-
-# Shared env for the two Python services (API + worker). YAML anchor keeps them
-# in sync so a model/DB/auth setting can't drift between them.
 x-backend-env: &backend-env
   MODEL: ${MODEL:-vertex_ai/gemini-2.5-flash-lite}
   JUDGE_MODEL: ${JUDGE_MODEL:-vertex_ai/gemini-2.5-flash-lite}
-  # Optional per-tier model overrides (see app/routing.py). Unset -> all tiers
-  # fall back to MODEL, i.e. today's single-model behaviour.
   TIER_CHEAP: ${TIER_CHEAP:-}
   TIER_STANDARD: ${TIER_STANDARD:-}
   TIER_QUALITY: ${TIER_QUALITY:-}
@@ -25,9 +8,12 @@ x-backend-env: &backend-env
   VERTEXAI_LOCATION: ${VERTEXAI_LOCATION:-global}
   GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key.json
   GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-concierge}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-concierge}
-  REDIS_URL: redis://redis:6379/0
-  # Auth (see app/config.py). JWT_SECRET MUST be a long random string in prod.
+
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}}
+  
+  REDIS_URL: ${REDIS_URL:-redis://${REDIS_USER:-default}:${REDIS_PASSWORD}@${REDIS_HOST:-localhost}:${REDIS_PORT:-6379}/${REDIS_DB_INDEX:-0}}
+
+  # Auth & Security
   JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (a long random string)}
   COOKIES_SECURE: ${COOKIES_SECURE:-true}
   FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in .env}
@@ -36,109 +22,49 @@ x-backend-env: &backend-env
   GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
   ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
   RATE_LIMIT_GENERATE: ${RATE_LIMIT_GENERATE:-20/minute}
-  # Account activation and automatic completed-response email. RESEND_API_KEY
-  # plus a verified EMAIL_FROM sender are required in production.
+
+  # Notifications & Communications
   RESEND_API_KEY: ${RESEND_API_KEY:-}
   EMAIL_FROM: "${EMAIL_FROM:-AI Travel Concierge <onboarding@resend.dev>}"
   EMAIL_VERIFICATION_SECRET: ${EMAIL_VERIFICATION_SECRET:-}
   OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-600}
   OTP_RESEND_COOLDOWN_SECONDS: ${OTP_RESEND_COOLDOWN_SECONDS:-60}
   OTP_MAX_ATTEMPTS: ${OTP_MAX_ATTEMPTS:-5}
-  # Automatic itinerary PDF delivery to Telegram (worker-only feature — the
-  # cron poller lives in app/queue/telegram_poll.py). Unset disables it.
   TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-  # R2 is preferred in production. The named local volume remains a durable
-  # fallback when AVATAR_STORAGE_BACKEND=local.
+
+  # File Storage
   AVATAR_STORAGE_BACKEND: ${AVATAR_STORAGE_BACKEND:-local}
   AVATAR_LOCAL_DIR: /var/lib/bedrock/avatars
   R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
   R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
   R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
   R2_BUCKET: ${R2_BUCKET:-}
-  # Grounded data sources (Phase 2) — each independently optional.
+
+  # External APIs
   TAVILY_API_KEY: ${TAVILY_API_KEY:-}
   GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY:-}
   TRAVELPAYOUTS_TOKEN: ${TRAVELPAYOUTS_TOKEN:-}
   TRAVELPAYOUTS_MARKER: ${TRAVELPAYOUTS_MARKER:-621166}
 
 services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-concierge}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: ${POSTGRES_DB:-concierge}
-    volumes:
-      - concierge_pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-concierge}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - concierge_net
-      - dokploy-network
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    # Progress streams only (Postgres is the source of truth). Cap memory + evict
-    # oldest so a burst of jobs can't OOM the box.
-    command: ["redis-server", "--maxmemory", "192mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - concierge_net
-      - dokploy-network
-
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    # The API container OWNS migrations (entrypoint runs app.db_bootstrap).
     environment:
       <<: *backend-env
-      # uvicorn worker process count (entrypoint.sh). Only the API container
-      # scales this — the crew-free process is cheap enough (~250 MB) to run
-      # more than one, unlike the worker, which holds ~1.2 GB of torch/Chroma
-      # per process. Raising this multiplies DB pool usage (DB_POOL_SIZE
-      # below) and in-memory state per process, which is why rate limiting is
-      # Redis-backed (app/rate_limit.py) rather than in-memory.
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
-      # Trust X-Forwarded-* from the reverse proxy. uvicorn only honours these
-      # from `127.0.0.1` by default — true when nginx ran on the same host
-      # (DEPLOYMENT.md §7), false behind Traefik/Dokploy, where the proxy is a
-      # separate container with a bridge-network IP. Without this every request
-      # reports the proxy's IP as `request.client.host`, so slowapi's
-      # `get_remote_address` key (rate_limit.py) collapses ALL callers into one
-      # shared bucket — rate_limit_login (5/minute) and rate_limit_generate
-      # (20/minute) become global, not per-client. Safe to trust broadly here:
-      # this service publishes no host port, so the proxy is the only path in.
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
     volumes:
       - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
       - concierge_avatars:/var/lib/bedrock/avatars
-    # No host port binding: Traefik (managed by Dokploy) reaches this over
-    # dokploy-network, so nothing needs to be published on the host at all.
-    # If deploying with plain `docker compose` instead (no Dokploy/Traefik in
-    # front), add back `ports: ["127.0.0.1:8000:8000"]` here.
     expose:
       - "8000"
     networks:
-      - concierge_net
-      - dokploy-network
+      - app-network
 
   worker:
     build:
@@ -146,30 +72,19 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
       backend:
-        condition: service_started   # let the API run migrations first
+        condition: service_started
     environment:
       <<: *backend-env
-      # The worker must NOT race the API on migrations.
       ALEMBIC_SKIP: "1"
     volumes:
       - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
     command: ["arq", "app.queue.worker.WorkerSettings"]
-    # The image's built-in HEALTHCHECK curls localhost:8000/health, which is
-    # only meaningful for the `backend` service (uvicorn) — the worker runs
-    # `arq`, never binds port 8000, and would show "unhealthy" forever
-    # otherwise despite functioning normally.
     healthcheck:
       disable: true
-    # Give in-flight crew runs time to drain on a rolling deploy.
     stop_grace_period: 60s
     networks:
-      - concierge_net
-      - dokploy-network
+      - app-network
 
   frontend:
     build:
@@ -184,20 +99,12 @@ services:
     expose:
       - "5173"
     networks:
-      - concierge_net
-      - dokploy-network
+      - app-network
 
 networks:
-  concierge_net:
-    driver: bridge
-  # Created by Dokploy itself — declared external so this compose file doesn't
-  # try to create it. Traefik (Dokploy's reverse proxy) and every app it
-  # routes to share this network. Deploying with plain `docker compose`
-  # instead of Dokploy? Delete this network block and the `dokploy-network`
-  # line under each service's `networks:` above.
-  dokploy-network:
+  app-network:
+    name: ${DOCKER_NETWORK_NAME:-dokploy-network}
     external: true
 
 volumes:
-  concierge_pgdata:
   concierge_avatars:
