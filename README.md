@@ -239,8 +239,11 @@ from the reply model. `GROQ_COMPACT_PLANNING=true` is a separate option for
 Groq planning that generates a draft without the full research crew.
 See [hosted model setup and checks](docs/agents/hosted-free-models.md).
 
-The production Docker stack uses the [root environment template](.env.example).
-The mixed profile is documented for local API and worker processes.
+The production Docker stack defaults to the mixed profile. Set the model IDs
+and provider credentials from the [root environment template](.env.example)
+in Dokploy or in the root `.env`, then redeploy the backend and worker together.
+When migrating from Vertex AI, replace any existing `MODEL` and `JUDGE_MODEL`
+values and remove `VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`, and `GCP_KEY_FILE`.
 
 ## Repository layout
 

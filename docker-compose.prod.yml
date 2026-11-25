@@ -14,16 +14,20 @@
 # Shared env for the two Python services (API + worker). YAML anchor keeps them
 # in sync so a model/DB/auth setting can't drift between them.
 x-backend-env: &backend-env
-  MODEL: ${MODEL:-vertex_ai/gemini-2.5-flash-lite}
-  JUDGE_MODEL: ${JUDGE_MODEL:-vertex_ai/gemini-2.5-flash-lite}
-  # Optional per-tier model overrides (see app/routing.py). Unset -> all tiers
-  # fall back to MODEL, i.e. today's single-model behaviour.
+  # Groq handles chat and evaluation. The crew uses Cloudflare for planning and review.
+  MODEL: ${MODEL:-groq/openai/gpt-oss-120b}
+  JUDGE_MODEL: ${JUDGE_MODEL:-groq/openai/gpt-oss-120b}
   TIER_CHEAP: ${TIER_CHEAP:-}
-  TIER_STANDARD: ${TIER_STANDARD:-}
-  TIER_QUALITY: ${TIER_QUALITY:-}
-  VERTEXAI_PROJECT: ${VERTEXAI_PROJECT:?set VERTEXAI_PROJECT in .env}
-  VERTEXAI_LOCATION: ${VERTEXAI_LOCATION:-global}
-  GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key.json
+  TIER_STANDARD: ${TIER_STANDARD:-cloudflare/@cf/openai/gpt-oss-120b}
+  TIER_QUALITY: ${TIER_QUALITY:-cloudflare/@cf/zai-org/glm-4.7-flash}
+  TASK_TIERS: ${TASK_TIERS:-extraction=cheap,reply=cheap,answer=cheap,research=quality,planner=quality,reviewer=standard,judge=standard}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+  CLOUDFLARE_API_KEY: ${CLOUDFLARE_API_KEY:-}
+  GROQ_COMPACT_PLANNING: ${GROQ_COMPACT_PLANNING:-false}
+  GROQ_REUSE_EXTRACTED_REPLY: ${GROQ_REUSE_EXTRACTED_REPLY:-false}
+  CLOUDFLARE_CREW_MAX_RPM: ${CLOUDFLARE_CREW_MAX_RPM:-30}
+  REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
   GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
   DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-concierge}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-concierge}
   REDIS_URL: redis://redis:6379/0
@@ -128,7 +132,6 @@ services:
       # this service publishes no host port, so the proxy is the only path in.
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
     volumes:
-      - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
       - concierge_avatars:/var/lib/bedrock/avatars
     # No host port binding: Traefik (managed by Dokploy) reaches this over
     # dokploy-network, so nothing needs to be published on the host at all.
@@ -156,8 +159,6 @@ services:
       <<: *backend-env
       # The worker must NOT race the API on migrations.
       ALEMBIC_SKIP: "1"
-    volumes:
-      - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
     command: ["arq", "app.queue.worker.WorkerSettings"]
     # The image's built-in HEALTHCHECK curls localhost:8000/health, which is
     # only meaningful for the `backend` service (uvicorn) — the worker runs
