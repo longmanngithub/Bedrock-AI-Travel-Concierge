@@ -26,6 +26,7 @@ from . import keys
 from .events import RedisProgressPublisher
 
 logger = logging.getLogger("app.queue.jobs")
+_TERMINAL = {JobStatus.cancelled, JobStatus.succeeded, JobStatus.failed, JobStatus.expired}
 
 
 def _utcnow() -> datetime:
@@ -66,8 +67,10 @@ def _load_previous(job: Job, previous_record_id: int | None) -> Itinerary | None
             return None
 
 
-def _generation_metadata() -> dict:
+def _generation_metadata(compact_model: str | None) -> dict:
     settings = get_settings()
+    if compact_model is not None:
+        return {"model": compact_model, "generation_config": {"mode": "compact"}}
     return {
         "model": settings.model,
         "generation_config": {
@@ -82,19 +85,26 @@ def _generation_metadata() -> dict:
 async def run_itinerary_job(ctx: dict, job_id: str) -> None:
     from ..crew.crew import run_crew
     from ..crew.progress import JobCancelled
+    from ..routing import model_for
+
+    compact_model = None
+    if get_settings().groq_compact_planning:
+        planner_model = model_for("planner")
+        if planner_model.startswith("groq/"):
+            compact_model = planner_model
 
     redis_raw = ctx["redis_raw"]
     executor = ctx["executor"]
-    publisher = RedisProgressPublisher(redis_raw, job_id, session_factory=SessionLocal)
+    publisher = RedisProgressPublisher(redis_raw, job_id, session_factory=SessionLocal, compact=compact_model is not None)
 
     # Mark running.
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
+        job = db.get(Job, job_id, with_for_update=True)
         if job is None:
             logger.warning("job %s vanished before start", job_id)
             return
-        if job.status in (JobStatus.cancelled, JobStatus.succeeded):
-            return  # already terminal (cancel raced the start)
+        if job.status in _TERMINAL:
+            return  # a late or duplicate queue message must not reopen a terminal job
         job.status = JobStatus.running
         job.started_at = _utcnow()
         job.heartbeat_at = _utcnow()
@@ -124,6 +134,13 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
     loop = asyncio.get_running_loop()
 
     def _blocking():
+        if compact_model is not None:
+            from ..crew.crew import run_compact_itinerary
+
+            return run_compact_itinerary(
+                trip_request, model=compact_model, previous=previous,
+                traveller_memory=traveller_memory, progress=publisher,
+            )
         # ThreadPoolExecutor does not propagate contextvars — run_crew sets
         # CURRENT_SINK/CURRENT_JOB itself from these args, inside this thread.
         return run_crew(
@@ -149,43 +166,32 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
         await _finish_error(job_id, publisher, classify_exception(exc))
         return
 
-    # A cancellation can race the final executor result. Never overwrite the
-    # stopped transcript with a completed itinerary or trigger an email.
-    with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        if job is None or job.status == JobStatus.cancelled:
-            if job is not None:
-                _reconcile_placeholder_message(
-                    db, job_id, kind="stopped", content="You stopped this response.", trip_record_id=None
-                )
-                db.commit()
-            publisher.emit_terminal({"kind": "cancelled", "status": "cancelled"})
-            return
-
     # Persist the record + mark job succeeded.
     delivery_id: str | None = None
     telegram_user_id: str | None = None
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
+        # Serialize with Stop so a late model response cannot overwrite it.
+        job = db.get(Job, job_id, with_for_update=True)
+        if job is None or job.status in _TERMINAL:
+            return
         record = TripRecord(
-            system="crew",
+            system="compact" if compact_model else "crew",
             destination=trip_request.destination,
             request=trip_request.model_dump(mode="json"),
             itinerary=itinerary.model_dump(mode="json"),
             within_budget=itinerary.within_budget,
             elapsed_seconds=elapsed,
-            user_id=job.user_id if job else None,
-            conversation_id=job.conversation_id if job else None,
+            user_id=job.user_id,
+            conversation_id=job.conversation_id,
             job_id=job_id,
-            **_generation_metadata(),
+            **_generation_metadata(compact_model),
         )
         db.add(record)
         db.flush()
         record_id = record.id
-        if job is not None:
-            job.status = JobStatus.succeeded
-            job.result_record_id = record_id
-            job.finished_at = _utcnow()
+        job.status = JobStatus.succeeded
+        job.result_record_id = record_id
+        job.finished_at = _utcnow()
         _reconcile_placeholder_message(db, job_id, kind="result", content=None, trip_record_id=record_id)
         message = db.scalar(select(Message).where(Message.job_id == job_id))
         if message is not None:
@@ -196,7 +202,7 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
                     {"label": "What should I pack?", "value": "What should I pack for this trip?"},
                 ]
             }
-            if job is not None and job.user_id is not None:
+            if job.user_id is not None:
                 user = db.get(User, job.user_id)
                 if user is not None:
                     delivery = create_completion_delivery(db, message=message, user=user)
@@ -208,15 +214,26 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
                     if user.telegram_chat_id is not None:
                         telegram_user_id = str(user.id)
         db.commit()
+
+        publisher.emit_terminal({
+            "kind": "done",
+            "status": "succeeded",
+            "record_id": record_id,
+            "elapsed_seconds": round(elapsed, 1),
+            "itinerary": itinerary.model_dump(mode="json"),
+        })
+
         # Only after a genuinely successful build — a trip that errored out
         # taught us nothing real about the traveller (see memory.py).
-        if memory_opt_in and job is not None and job.user_id is not None:
-            update_preferences_after_trip(job.user_id, trip_request, db)
+        if memory_opt_in and job.user_id is not None:
+            try:
+                update_preferences_after_trip(job.user_id, trip_request, db)
+            except Exception:
+                logger.exception("Could not update traveller preferences for job %s", job_id)
 
     # Automatic delivery on every finished plan (fresh or replanned) — one
     # PDF per channel the traveller has actually opted into, run concurrently
-    # so a slow email/Telegram send doesn't add to the other's latency before
-    # the "done" frame below.
+    # after the itinerary is available to the browser.
     deliveries = []
     if delivery_id:
         deliveries.append(send_response_email_job(ctx, delivery_id))
@@ -225,31 +242,17 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
     if deliveries:
         await asyncio.gather(*deliveries)
 
-    publisher.emit_terminal({
-        "kind": "done",
-        "status": "succeeded",
-        "record_id": record_id,
-        "elapsed_seconds": round(elapsed, 1),
-        "itinerary": itinerary.model_dump(mode="json"),
-    })
-
 
 async def _finish_error(job_id: str, publisher: RedisProgressPublisher, err: AppError) -> None:
     message = USER_MESSAGES.get(err.code, USER_MESSAGES[ErrorCode.E_INTERNAL])
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        if job is not None and job.status == JobStatus.cancelled:
-            # A cancel already settled this job durably (cancel_job /
-            # _finish_cancelled). A non-JobCancelled exception racing in from
-            # the in-flight crew run afterward must not stomp that terminal
-            # state back to "failed" — re-affirm cancelled and stop.
-            publisher.emit_terminal({"kind": "cancelled", "status": "cancelled"})
+        job = db.get(Job, job_id, with_for_update=True)
+        if job is None or job.status in _TERMINAL:
             return
-        if job is not None:
-            job.status = JobStatus.failed
-            job.error_code = err.code.value
-            job.error_detail = err.log_detail          # internal only
-            job.finished_at = _utcnow()
+        job.status = JobStatus.failed
+        job.error_code = err.code.value
+        job.error_detail = err.log_detail          # internal only
+        job.finished_at = _utcnow()
         _reconcile_placeholder_message(db, job_id, kind="error", content=message, trip_record_id=None)
         db.commit()
     logger.error("job %s failed: %s | %s", job_id, err.code.value, err.log_detail)
@@ -264,10 +267,11 @@ async def _finish_error(job_id: str, publisher: RedisProgressPublisher, err: App
 
 async def _finish_cancelled(job_id: str, publisher: RedisProgressPublisher) -> None:
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        if job is not None:
-            job.status = JobStatus.cancelled
-            job.finished_at = _utcnow()
+        job = db.get(Job, job_id, with_for_update=True)
+        if job is None or job.status in _TERMINAL:
+            return
+        job.status = JobStatus.cancelled
+        job.finished_at = _utcnow()
         _reconcile_placeholder_message(
             db, job_id, kind="stopped", content="You stopped this response.", trip_record_id=None
         )
@@ -287,7 +291,7 @@ async def reap_stale_jobs(ctx: dict) -> None:
                 Job.status == JobStatus.running,
                 Job.heartbeat_at.isnot(None),
                 Job.heartbeat_at < cutoff,
-            )
+            ).with_for_update(skip_locked=True)
         ).all()
         for job in stale:
             job.status = JobStatus.expired

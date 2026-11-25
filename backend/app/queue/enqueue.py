@@ -12,11 +12,12 @@ from __future__ import annotations
 import uuid
 
 from arq.connections import ArqRedis
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from ..models import Job, JobStatus
+from ..errors import AppError, ErrorCode
+from ..models import Conversation, Job, JobStatus, Message
 from ..schemas import TripRequest
 from . import keys
 
@@ -30,9 +31,19 @@ async def enqueue_itinerary(
     user_id: uuid.UUID | None,
     conversation_id: uuid.UUID | None,
     idempotency_key: str,
+    reply_text: str | None = None,
 ) -> tuple[uuid.UUID, bool]:
-    """Return (job_id, was_created). An existing key returns the prior job id
-    with was_created=False and does not re-enqueue."""
+    """Return (job_id, was_created) and recover a missed queue publish on retry."""
+    create_placeholder = conversation_id is not None and reply_text is not None
+    if create_placeholder:
+        owned_conversation = db.scalar(
+            select(Conversation.id).where(
+                Conversation.id == conversation_id, Conversation.user_id == user_id
+            ).with_for_update()
+        )
+        if owned_conversation is None:
+            raise AppError(ErrorCode.E_NOT_FOUND)
+
     job_id = uuid.uuid4()
     payload = {
         "trip_request": trip_request.model_dump(mode="json"),
@@ -53,12 +64,33 @@ async def enqueue_itinerary(
         .returning(Job.id)
     )
     inserted_id = db.execute(stmt).scalar_one_or_none()
+
+    was_created = inserted_id is not None
+    if was_created:
+        job_id = inserted_id
+    else:
+        existing = db.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+        if existing is None or existing.user_id != user_id or existing.conversation_id != conversation_id:
+            raise AppError(ErrorCode.E_VALIDATION, log_detail="idempotency key cannot be reused for this request")
+        job_id = existing.id
+        if existing.status != JobStatus.queued:
+            db.commit()
+            return job_id, False
+
+    # Commit the transcript placeholder before the worker can read the job.
+    # A replay repairs a missing placeholder without duplicating an existing one.
+    if create_placeholder and db.scalar(select(Message.id).where(Message.job_id == job_id)) is None:
+        last_seq = db.scalar(
+            select(func.max(Message.seq)).where(Message.conversation_id == conversation_id)
+        )
+        db.add(Message(
+            conversation_id=conversation_id, role="assistant", content=reply_text,
+            kind="job", job_id=job_id, seq=(last_seq or 0) + 1,
+        ))
     db.commit()
 
-    if inserted_id is None:
-        # Conflict: the row already exists — return the existing job id, no enqueue.
-        existing = db.scalar(select(Job.id).where(Job.idempotency_key == idempotency_key))
-        return existing, False
-
+    # A database commit can succeed before Redis does. Re-publish a still-
+    # queued job on retry using the original arq ID, which deduplicates a
+    # publish that already reached Redis.
     await pool.enqueue_job("run_itinerary_job", str(job_id), _job_id=keys.arq_job_id(str(job_id)))
-    return job_id, True
+    return job_id, was_created

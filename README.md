@@ -45,7 +45,7 @@ SSE stream for live per-agent progress.
 | ----------- | ------------------------------------------------------------ |
 | Agents      | CrewAI (sequential process)                                  |
 | Tools / RAG | LangChain + ChromaDB + local sentence-transformers           |
-| LLM         | Google Gemini 3.1 Flash-Lite (provider-agnostic via LiteLLM) |
+| LLM         | Task-based routing through LiteLLM |
 | API         | FastAPI                                                      |
 | Persistence | PostgreSQL (SQLAlchemy)                                      |
 | Frontend    | Next.js (App Router) + Tailwind CSS v4, streaming chat UI    |
@@ -100,14 +100,9 @@ crew/baseline directly and has no account or Redis dependency.
   it. On this machine, create the venv with `python3.12`.
 - Node 18+
 - Docker (for PostgreSQL) **or** a local Postgres
-- Gemini access, either:
-  - **Vertex AI** (recommended if you have Google Cloud credit): run
-    `gcloud auth application-default login`, enable the _Vertex AI API_, and set
-    `MODEL`/`VERTEXAI_PROJECT` in `.env` (no rate-limit wall — see _Switching LLM
-    provider_ below), or
-  - a **free** Gemini API key from https://aistudio.google.com → _Get API key_
-    (no card; free tier is limited to 15 requests/minute).
-    No key is needed for web search or embeddings.
+- Credentials for your selected model providers. The example file defaults to
+  Vertex AI. It also includes a Groq and Cloudflare profile for local development.
+  See [model setup](#switching-llm-provider).
 
 ## Setup
 
@@ -128,7 +123,7 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-cp .env.example .env             # then paste your GOOGLE_API_KEY into .env
+cp -n .env.example .env          # then configure your selected provider(s)
 alembic upgrade head              # apply migrations
 
 python -m app.rag.ingest         # build the RAG vector store (first run downloads
@@ -157,7 +152,7 @@ will sit at "Researching your trip…" indefinitely) until this is running.
 
 ```bash
 cd frontend
-cp .env.example .env             # NEXT_PUBLIC_API_URL defaults to http://localhost:8000
+cp -n .env.example .env          # NEXT_PUBLIC_API_URL defaults to http://localhost:8000
 npm install
 npm run dev                      # Next.js UI on http://localhost:5173
 ```
@@ -175,6 +170,17 @@ boarding-pass card. (The single-LLM baseline still lives behind
 runs inline since it's a single LLM call, not a background job.)
 
 ---
+
+If those ports are occupied, map each Docker service to an available host port
+and update `DATABASE_URL` and `REDIS_URL` in `backend/.env`. Use the same
+settings in the API and worker. To run the frontend on another port, use
+`npx next dev -p 5174` and add its origin to `ALLOWED_ORIGINS` in
+`backend/.env`. Set `FRONTEND_URL` to that origin if you use Google sign-in.
+
+Chat text arrives over server-sent events. The UI paces incoming text so a
+burst of tokens can still appear progressively. It follows the browser’s
+reduced-motion preference. When chat has the required trip details, the API
+hands the request to the worker and the UI shows live itinerary progress.
 
 ## Evaluation
 
@@ -216,34 +222,25 @@ destinations) for a more diverse sample.
 
 ## Switching LLM provider
 
-Everything routes through `app/llm.py`, so only `.env` changes:
+Use [`backend/.env.example`](backend/.env.example) as a guide for setting model
+IDs and credentials in `backend/.env`, then restart the API and worker.
+`MODEL` supplies the default model. Use `TIER_CHEAP`, `TIER_STANDARD`, `TIER_QUALITY`, and
+`TASK_TIERS` to assign different models to chat, research, planning, or review.
 
-```bash
-# Vertex AI — RECOMMENDED if you have Google Cloud credit (e.g. the $300 free
-# trial). No API key, and NONE of the Developer-API 15 req/min limit.
-#   1) gcloud auth application-default login
-#   2) enable the "Vertex AI API" on your project
-MODEL=vertex_ai/gemini-2.5-flash-lite
-JUDGE_MODEL=vertex_ai/gemini-2.5-flash-lite
-VERTEXAI_PROJECT=your-gcp-project-id
-VERTEXAI_LOCATION=us-central1
+The optional mixed profile uses Groq GPT-OSS for chat, Cloudflare GLM-4.7-Flash
+for research and planning, and Cloudflare GPT-OSS for structured review. Set
+`CLOUDFLARE_CREW_MAX_RPM=30` for the documented starting point when every crew
+model runs on Cloudflare. The Cloudflare reviewer validates the itinerary and
+shares `REQUEST_TIMEOUT` across its first request and one retry.
 
-# Groq (fast, free tier)
-MODEL=groq/llama-3.3-70b-versatile
-GROQ_API_KEY=...
+`GROQ_REUSE_EXTRACTED_REPLY=true` saves a model call on eligible Groq chat
+turns by reusing the extraction reply. Use the default `false` to stream text
+from the reply model. `GROQ_COMPACT_PLANNING=true` is a separate option for
+Groq planning that generates a draft without the full research crew.
+See [hosted model setup and checks](docs/agents/hosted-free-models.md).
 
-# Ollama (fully local, no key; run `ollama serve` first)
-MODEL=ollama/llama3.1
-OLLAMA_API_BASE=http://localhost:11434
-```
-
-**Vertex vs Developer API:** the Gemini _Developer API_ (api key from AI Studio)
-has a free tier capped at **15 requests/minute**, which a multi-agent crew
-exceeds in a single run — forcing throttling and occasional 429 failures during
-an eval sweep. _Vertex AI_ (authenticated by ADC, billed to Cloud credit) has
-production quotas and no such wall, so the full sweep runs without throttling or
-429s. (Latency is similar either way — the crew is call-bound, ~100 s, not
-throttle-bound.) Both are one-line `.env` swaps.
+The production Docker stack uses the [root environment template](.env.example).
+The mixed profile is documented for local API and worker processes.
 
 ## Repository layout
 
@@ -260,9 +257,15 @@ backend/evaluation/     scenarios, metrics, run_eval, reviewer_probe
 frontend/               Next.js (App Router) streaming chat UI
 ```
 
+## Development checks
+
+Run `python -m unittest discover -s tests` from `backend/`. Run `npm run lint`
+and `npm run build` from `frontend/`.
+
 ## Troubleshooting
 
-- **`Generation failed` / auth error** — check `GOOGLE_API_KEY` in `backend/.env`.
+- **Model authentication failed.** Check the credentials for the provider assigned to that task.
+- **An itinerary stays queued.** Confirm the API and worker use the same Redis URL and that the worker is running.
 - **`Knowledge base unavailable`** — run `python -m app.rag.ingest`.
 - **DB connection refused** — ensure `docker compose up -d db` is running (or fix
   `DATABASE_URL`).

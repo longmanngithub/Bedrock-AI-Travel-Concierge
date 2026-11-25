@@ -514,7 +514,7 @@ export default function TravelTicket({ itinerary, tripRequest, elapsedSeconds, r
 
       <div className="border-t border-line px-5 py-3 text-xs text-muted">
         <p>
-          Crafted by Bedrock's travel crew{elapsedSeconds ? ` · ${elapsedSeconds.toFixed(1)}s` : ""}
+          Crafted by Bedrock&apos;s travel crew{elapsedSeconds ? ` · ${elapsedSeconds.toFixed(1)}s` : ""}
         </p>
         <p className="mt-1">
           AI-generated — prices, hours, and availability are estimates. Please

@@ -1,9 +1,6 @@
 name: CI
 
-# There is no automated test suite in this project yet (course-project scope
-# choice — see CLAUDE.md). This workflow is the correctness safety net until
-# one exists: it makes sure the backend still imports, the frontend still
-# builds, and both Docker images still build, on every push/PR.
+# Run backend regression tests and verify that the frontend and both container images build.
 on:
   push:
     branches: [main]
@@ -32,6 +29,13 @@ jobs:
         # evaluation/ is gitignored (not pushed to GitHub — see .gitignore),
         # so only the shipped `app` package is checked here.
         run: python -m compileall -q app
+
+      - name: Backend regression tests
+        env:
+          CREWAI_DISABLE_TELEMETRY: "true"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          OTEL_SDK_DISABLED: "true"
+        run: python -m unittest discover -s tests
 
       - name: Import smoke test
         # No live DB/LLM key needed to import — Settings() falls back to

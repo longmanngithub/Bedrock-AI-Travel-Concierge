@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
+from redis.exceptions import RedisError
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from sqlalchemy import select
@@ -23,13 +26,15 @@ from ..auth.cookies import verify_csrf
 from ..auth.deps import current_user
 from ..database import get_db
 from ..errors import AppError, ErrorCode, USER_MESSAGES
-from ..models import Job, JobStatus, Message, User
+from ..models import Job, JobStatus, Message, TripRecord, User
 from ..queue import keys
-from ..queue.settings import async_redis, get_arq_pool
+from ..queue.settings import async_redis
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+logger = logging.getLogger(__name__)
 
 _TERMINAL = {JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled, JobStatus.expired}
+_TERMINAL_EVENTS = {"done", "error", "cancelled"}
 
 
 class JobView(BaseModel):
@@ -97,40 +102,34 @@ async def cancel_job(
     job_id: uuid.UUID, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)
 ) -> JobView:
     verify_csrf(request)
-    job = _owned_job(job_id, user, db)
+    job = db.scalar(select(Job).where(Job.id == job_id, Job.user_id == user.id).with_for_update())
+    if job is None:
+        raise AppError(ErrorCode.E_JOB_NOT_FOUND, log_detail="job not found/owned")
     if job.status in _TERMINAL:
         return _job_view(job)
 
-    r = async_redis()
+    placeholder = db.scalar(select(Message).where(Message.job_id == job.id))
+    if placeholder is not None:
+        placeholder.kind = "stopped"
+        placeholder.content = "You stopped this response."
+    job.status = JobStatus.cancelled
+    job.finished_at = datetime.now(timezone.utc)
+    view = _job_view(job)
+    db.commit()
+
     try:
-        await r.set(keys.cancel_key(str(job_id)), "1", ex=keys.CANCEL_TTL)
-        try:
-            pool = await get_arq_pool()
-            await pool.abort_job(keys.arq_job_id(str(job_id)))
-        except Exception:  # noqa: BLE001 - abort is best-effort (job may be mid-run)
-            pass
-
-        # Settle the durable record immediately rather than waiting for a crew
-        # checkpoint. This prevents stale-job reaping from overwriting the
-        # user's stopped feedback if arq aborts a running coroutine first.
-        placeholder = db.scalar(select(Message).where(Message.job_id == job.id))
-        if placeholder is not None:
-            placeholder.kind = "stopped"
-            placeholder.content = "You stopped this response."
-        job.status = JobStatus.cancelled
-        job.finished_at = datetime.now(timezone.utc)
-        db.commit()
-
         # A queued job can be aborted before a worker has a chance to publish
         # anything. Persist its terminal SSE frame here so every subscriber
-        # settles as cancelled rather than eventually looking expired.
+        # settles as cancelled. The worker also checks the durable job state.
         frame = json.dumps({"kind": "cancelled", "status": "cancelled"})
-        await r.xadd(keys.events_key(str(job_id)), {"d": frame}, maxlen=keys.EVENTS_MAXLEN, approximate=True)
-        await r.expire(keys.events_key(str(job_id)), keys.STATE_TTL)
-        await r.set(keys.state_key(str(job_id)), frame, ex=keys.STATE_TTL)
-    finally:
-        await r.aclose()
-    return _job_view(job)
+        async with async_redis() as r:
+            await r.set(keys.cancel_key(str(job_id)), "1", ex=keys.CANCEL_TTL)
+            await r.xadd(keys.events_key(str(job_id)), {"d": frame}, maxlen=keys.EVENTS_MAXLEN, approximate=True)
+            await r.expire(keys.events_key(str(job_id)), keys.STATE_TTL)
+            await r.set(keys.state_key(str(job_id)), frame, ex=keys.STATE_TTL)
+    except RedisError:
+        logger.warning("Could not publish cancellation for job %s", job_id)
+    return view
 
 
 @router.get("/{job_id}/events")
@@ -140,35 +139,29 @@ async def job_events(
     job = _owned_job(job_id, user, db)
     stream = keys.events_key(str(job_id))
     state_key = keys.state_key(str(job_id))
-    terminal_now = job.status in _TERMINAL
+    terminal_now = _terminal_frame(db, job)
     last_event_id = request.headers.get("Last-Event-ID")
 
     async def gen():
+        if terminal_now is not None:
+            yield f"data: {json.dumps(terminal_now)}\n\n"
+            return
+
         r = async_redis()
         try:
-            # Terminal already: emit the stored final state and close.
-            if terminal_now:
-                snap = await r.get(state_key)
-                if snap:
-                    yield f"data: {snap.decode() if isinstance(snap, bytes) else snap}\n\n"
-                else:
-                    yield "data: " + json.dumps({
-                        "kind": "error", "status": job.status.value,
-                        "code": job.error_code or ErrorCode.E_JOB_EXPIRED.value,
-                        "message": USER_MESSAGES[ErrorCode.E_JOB_EXPIRED],
-                    }) + "\n\n"
-                return
-
-            # Fresh viewer (no Last-Event-ID): send the snapshot once, then tail
-            # from the current stream tail so we don't replay every step frame.
+            # Capture the cursor before the snapshot so an update published
+            # between them is still eligible for stream replay.
             if not last_event_id:
-                snap = await r.get(state_key)
-                if snap:
-                    yield f"data: {snap.decode() if isinstance(snap, bytes) else snap}\n\n"
                 tail = await r.xrevrange(stream, count=1)
                 cursor = tail[0][0] if tail else "0"
                 if isinstance(cursor, bytes):
                     cursor = cursor.decode()
+                snap = await r.get(state_key)
+                if snap:
+                    payload = snap.decode() if isinstance(snap, bytes) else snap
+                    yield f"data: {payload}\n\n"
+                    if _is_terminal_event(payload):
+                        return
             else:
                 cursor = last_event_id
 
@@ -183,11 +176,9 @@ async def job_events(
                     # Safety: if the DB says terminal but no stream frame arrived
                     # (e.g. stream expired), settle from the DB.
                     if idle >= 3:
-                        fresh = _fresh_status(job_id)
-                        if fresh in _TERMINAL:
-                            snap = await r.get(state_key)
-                            if snap:
-                                yield f"data: {snap.decode() if isinstance(snap, bytes) else snap}\n\n"
+                        terminal = await run_in_threadpool(_fresh_terminal_frame, job_id)
+                        if terminal is not None:
+                            yield f"data: {json.dumps(terminal)}\n\n"
                             return
                         idle = 0
                     continue
@@ -201,11 +192,7 @@ async def job_events(
                             continue
                         payload = raw.decode() if isinstance(raw, bytes) else raw
                         yield f"id: {eid}\ndata: {payload}\n\n"
-                        try:
-                            kind = json.loads(payload).get("kind")
-                        except Exception:  # noqa: BLE001
-                            kind = None
-                        if kind in ("done", "error", "cancelled"):
+                        if _is_terminal_event(payload):
                             return
         finally:
             await r.aclose()
@@ -217,9 +204,41 @@ async def job_events(
     )
 
 
-def _fresh_status(job_id: uuid.UUID) -> JobStatus:
+def _is_terminal_event(raw: str) -> bool:
+    try:
+        return json.loads(raw).get("kind") in _TERMINAL_EVENTS
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False
+
+
+def _terminal_frame(db: Session, job: Job | None) -> dict | None:
+    status = job.status if job else JobStatus.expired
+    if status not in _TERMINAL:
+        return None
+    if status == JobStatus.cancelled:
+        return {"kind": "cancelled", "status": status.value}
+    if status == JobStatus.succeeded and job and job.result_record_id is not None:
+        record = db.get(TripRecord, job.result_record_id)
+        if record is not None and record.user_id == job.user_id:
+            return {
+                "kind": "done", "status": status.value, "record_id": job.result_record_id,
+                "itinerary": record.itinerary, "elapsed_seconds": round(record.elapsed_seconds, 1),
+            }
+
+    code = ErrorCode.E_JOB_EXPIRED if status == JobStatus.expired else ErrorCode.E_INTERNAL
+    if job and job.error_code:
+        try:
+            code = ErrorCode(job.error_code)
+        except ValueError:
+            pass
+    return {
+        "kind": "error", "status": status.value, "code": code.value,
+        "message": USER_MESSAGES[code], "retryable": AppError(code).retryable,
+    }
+
+
+def _fresh_terminal_frame(job_id: uuid.UUID) -> dict | None:
     from ..database import SessionLocal
 
     with SessionLocal() as db:
-        job = db.get(Job, job_id)
-        return job.status if job else JobStatus.expired
+        return _terminal_frame(db, db.get(Job, job_id))

@@ -21,6 +21,7 @@ from datetime import date, timedelta
 
 from pydantic import BaseModel, Field, field_validator
 
+from .errors import AppError, ErrorCode
 from .llm import build_llm, call_with_retry, extract_json, sanitize_untrusted, strip_emoji
 from .schemas import Itinerary, TripRequest
 
@@ -254,21 +255,19 @@ class SlotValues(BaseModel):
     special_requests: str | None = None
     discussed_topics: str | None = None
 
+    @field_validator("interests", mode="before")
+    @classmethod
+    def _empty_interests(cls, value):
+        return [] if value is None else value
+
 
 class ExtractionResult(BaseModel):
     on_topic: bool = True
     slots: SlotValues = Field(default_factory=SlotValues)
     missing_required: list[str] = Field(default_factory=list)
     ready_to_plan: bool = False
-    # assistant_reply/quick_reply_slot are typed nullable even though the
-    # prompt always asks for a string: the model legitimately emits explicit
-    # JSON `null` for quick_reply_slot whenever ready_to_plan is true (there's
-    # no slot left to ask about) or when a follow-up needs no chips. A
-    # non-nullable `str` here previously made that `null` fail Pydantic
-    # validation, which fell through to the generic "didn't quite catch that"
-    # fallback and silently dropped the entire turn — including turns that
-    # were actually ready to build the itinerary. Verified live: reproduced
-    # 3/3 on a plain "ready to plan" turn before this fix.
+    # Some providers emit null for optional fields even when the prompt asks
+    # for an empty string or array.
     assistant_reply: str | None = ""
     quick_reply_slot: str | None = ""
     quick_reply_options: list[str] = Field(default_factory=list)
@@ -284,11 +283,10 @@ class ExtractionResult(BaseModel):
     def _none_to_empty_str(cls, v):
         return v or ""
 
-
-_FALLBACK_REPLY = (
-    "Hmm, I didn't quite catch that — mind rephrasing? I'm all ears for anything "
-    "trip-related."
-)
+    @field_validator("missing_required", "quick_reply_options", mode="before")
+    @classmethod
+    def _empty_options(cls, value):
+        return [] if value is None else value
 
 # Order in which we nudge the user for a missing detail, so the streamed reply
 # focuses on the single most useful question rather than listing them all.
@@ -686,9 +684,41 @@ _EXTRACTION_SYSTEM_PROMPT_TEMPLATE = (
     f"{_PERSONA}\n\n{_SAFETY_CORE}\n\n{_EXTRACTION_TASK_INSTRUCTIONS}"
 )
 
+_INITIAL_TRIP_EXTRACTION_INSTRUCTIONS = """Read the full conversation. Return only one
+JSON object containing on_topic (boolean), slots (object), missing_required
+(array), ready_to_plan (boolean), assistant_reply (string), quick_reply_slot
+(string), and quick_reply_options (array of strings).
 
-def _build_extraction_messages(messages: list[ChatTurn]) -> list[dict]:
-    system = _EXTRACTION_SYSTEM_PROMPT_TEMPLATE.format(today=date.today().isoformat())
+In slots extract destination, origin, "budget" (number), currency, start_date and
+end_date (YYYY-MM-DD), duration_days (integer), interests (array), travelers
+(integer), pace, and special_requests whenever the traveller supplies them.
+Read short replies in context. "Around $1,500" in response to a budget
+question means budget 1500 and currency USD. Carry forward all details stated
+earlier. Use null for unknown values and [] for empty lists. Use the
+traveller's latest correction where details conflict.
+
+Today is {today}. Resolve dates from the traveller's timing if provided. For
+vague timing, choose an approximate start about four weeks away within their
+stated month, season or day constraint. Supply duration_days and let the app
+compute the end date. Use 5 days if there is a date anchor and no trip length.
+Without a timing clue, ask. Treat stays of N nights as N+1 days.
+
+For a first trip, ready_to_plan is true once destination, budget, and dates
+are known (or the end can be computed). Use missing_required for the unfilled
+slots. Ask for one missing detail in this order: destination, dates, budget.
+Give concrete example answers that match it and use quick_reply_slot
+"destination", "dates" or "budget". Give no chips if ready.
+Treat genuine travel-knowledge questions as on_topic and answer them concisely
+without starting a plan just because the transcript has known trip details.
+Politely redirect unrelated requests. Never claim to have confirmed hotels,
+prices, or bookings. Keep assistant_reply short and use no emoji."""
+
+
+def _build_extraction_messages(messages: list[ChatTurn], *, compact: bool = False) -> list[dict]:
+    template = _EXTRACTION_SYSTEM_PROMPT_TEMPLATE
+    if compact:
+        template = f"{_PERSONA}\n\n{_SAFETY_CORE}\n\n{_INITIAL_TRIP_EXTRACTION_INSTRUCTIONS}"
+    system = template.format(today=date.today().isoformat())
     user = (
         f"{_wrap_conversation(messages)}\n\n"
         "Analyze the FULL conversation above per your instructions and "
@@ -726,6 +756,19 @@ Write ONLY your next reply to the traveller — plain conversational text, no
 JSON, no labels, no surrounding quotes, no markdown headers."""
 
 _REPLY_SYSTEM_PROMPT = f"{_PERSONA}\n\n{_SAFETY_CORE}\n\n{_REPLY_STYLE}"
+
+
+def reply_without_model(
+    messages: list[ChatTurn], extraction: ExtractionResult, *, reuse_extracted: bool
+) -> str | None:
+    """Return a usable reply when another provider request adds no value."""
+    if extraction.route == "plan":
+        return "I have the details. I’ll start building your itinerary."
+    if extraction.route == "revise":
+        return "I’ll update your itinerary with the changes you confirmed."
+    if reuse_extracted and not _itinerary_already_exists(messages):
+        return (extraction.assistant_reply or "").strip() or None
+    return None
 
 
 def build_reply_messages(messages: list[ChatTurn], extraction: ExtractionResult) -> list[dict]:
@@ -930,6 +973,29 @@ _BUDGET_RE = re.compile(
     r"[$€£¥]|\d[\d,]*\s*(usd|eur|gbp|dollars?|bucks?)|budget|afford",
     re.IGNORECASE,
 )
+_USD_BUDGET_REPLY = re.compile(
+    r"(?:around\s+|about\s+|roughly\s+)?\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+    r"(?:\s*(?:total|overall))?[.!]?",
+    re.IGNORECASE,
+)
+
+
+def _explicit_budget_answer(messages: list[ChatTurn]) -> float | None:
+    if len(messages) < 2:
+        return None
+    question, reply = messages[-2:]
+    if question.role != "assistant" or reply.role != "user":
+        return None
+    if "?" not in question.content or not re.search(r"\b(?:budget|spend)\b", question.content, re.I):
+        return None
+    amount = _USD_BUDGET_REPLY.fullmatch(reply.content.strip())
+    if amount:
+        budget = float(amount[1].replace(",", ""))
+        if 0 < budget <= 100_000_000:
+            return budget
+    return None
+
+
 _DATE_RE = re.compile(
     r"\b(january|february|march|april|may|june|july|august|september|october|"
     r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|"
@@ -1101,30 +1167,37 @@ def build_follow_ups(extraction: ExtractionResult) -> list[dict[str, str]]:
 def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> ExtractionResult:
     """Run the single slot-extraction / intent-classification LLM call.
 
-    Never raises on a malformed model response — a JSON parse or schema
-    validation failure degrades to a soft "please rephrase" clarify result
-    instead of surfacing a 500 to the client. Genuine LLM/transport failures
-    (network, auth, rate limit exhaustion) still propagate to the caller.
+    A malformed response becomes a retryable extraction error so the client
+    can submit the same turn again.
 
     `location_hint`, when given, is a reverse-geocoded "City, Country" from
     the traveller's opted-in browser location (see routers/geo.py) — never
     asked of the model, only used below as a deterministic backstop for
     `origin` when the conversation itself didn't establish one.
     """
-    llm = build_llm(temperature=0.2)
-    raw = call_with_retry(llm, _build_extraction_messages(messages))
+    llm = build_llm(task="extraction", temperature=0.2)
+    has_itinerary = _itinerary_already_exists(messages)
+    compact = getattr(llm, "model", "").startswith("groq/") and not has_itinerary
+    raw = call_with_retry(llm, _build_extraction_messages(messages, compact=compact))
     try:
+        if not isinstance(raw, str):
+            raise ValueError("Expected a text response")
         data = extract_json(raw)
         result = ExtractionResult(**data)
-    except Exception:
-        return ExtractionResult(
-            on_topic=True,
-            ready_to_plan=False,
-            assistant_reply=_FALLBACK_REPLY,
-        )
+    except (ValueError, TypeError) as exc:
+        raise AppError(
+            ErrorCode.E_EXTRACTION_FAILED,
+            log_detail=f"Invalid extraction response ({type(exc).__name__})",
+            retryable=True,
+        ) from exc
 
     # Deterministic backstop for the "no emoji" prompt rule — see strip_emoji.
     result.assistant_reply = strip_emoji(result.assistant_reply)
+
+    budget_answer = _explicit_budget_answer(messages) if result.on_topic and not has_itinerary else None
+    if budget_answer is not None:
+        result.slots.budget = budget_answer
+        result.slots.currency = "USD"
 
     # Deterministic origin backstop: only fills a gap the model left, never
     # overrides an origin the traveller actually stated in the conversation.
@@ -1199,7 +1272,6 @@ def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> 
             result.slots.start_date = start
             result.slots.end_date = result.slots.end_date or end
         still_missing = [f for f in REQUIRED_FIELDS if not getattr(result.slots, f)]
-        result.missing_required = [f for f in result.missing_required if f not in ("start_date", "end_date")]
         dates_backstopped = "start_date" not in still_missing and "end_date" not in still_missing
 
     # Deterministic safety net: never trust a self-reported `ready_to_plan`
@@ -1208,18 +1280,13 @@ def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> 
     # one JSON object built in one pass); without this, a false `ready_to_plan`
     # would reach main.py's TripRequest(**slots) construction and surface a
     # raw pydantic validation error to the user instead of a normal follow-up.
+    result.missing_required = still_missing
     if still_missing:
         result.ready_to_plan = False
-        result.missing_required = sorted(set(result.missing_required) | set(still_missing))
-    elif dates_backstopped and not _itinerary_already_exists(messages):
-        # Everything required is now actually present purely because the
-        # backstop just filled in dates the model itself failed to resolve —
-        # flip to ready rather than leaving a stale `ready_to_plan=False`
-        # that would just prompt the same question again. (Skipped if an
-        # itinerary already exists: that "false" is legitimate there — see
-        # the conversational-followup rule above, not a missing-slot issue.)
+    elif not has_itinerary and (dates_backstopped or budget_answer is not None):
+        # A direct slot answer completed the first plan, even if the model's
+        # readiness flag still reflects the preceding turn.
         result.ready_to_plan = True
-        result.missing_required = []
 
     # Deterministic safety net #2: never trust a self-reported `ready_to_plan`
     # for an EXISTING itinerary unless BOTH (a) there's something concrete to
@@ -1253,7 +1320,7 @@ def extract_turn(messages: list[ChatTurn], location_hint: str | None = None) -> 
     # that would have re-approved it were `elif`s that then never ran. That is
     # a third distinct way the same loop reappeared (observed live on "Yes, go
     # ahead"), so the branch order is gone rather than patched again.
-    if _itinerary_already_exists(messages):
+    if has_itinerary:
         has_something_concrete = bool((result.slots.special_requests or "").strip())
         last_user_text = next(
             (m.content for m in reversed(messages) if m.role == "user"), ""
