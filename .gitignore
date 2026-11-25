@@ -52,3 +52,7 @@ CLAUDE.md
 
 # Deployment
 DEPLOYMENT.md
+
+# Third-party skill copies restored from skills-lock.json
+/.agents/skills/*
+!/.agents/skills/security-review/

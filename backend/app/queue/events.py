@@ -30,12 +30,12 @@ def _now_iso() -> str:
 
 
 class RedisProgressPublisher:
-    def __init__(self, redis_client, job_id: str, *, session_factory=None) -> None:
+    def __init__(self, redis_client, job_id: str, *, session_factory=None, compact: bool = False) -> None:
         self._redis = redis_client
         self._job_id = job_id
         self._session_factory = session_factory
         self._lock = threading.Lock()
-        self._steps: dict[str, dict] = {s["key"]: s for s in initial_steps()}
+        self._steps: dict[str, dict] = {s["key"]: s for s in initial_steps(compact=compact)}
         self._status = "running"
         self._last_db_write = 0.0
         self._cancel_seen = False

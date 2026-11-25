@@ -12,13 +12,29 @@ import os
 import re
 import time
 from collections.abc import Iterator
+from functools import cache
 from typing import TYPE_CHECKING
 
 from .config import get_settings
-from .errors import AppError, ErrorCode
+from .errors import AppError, ErrorCode, classify_exception
 
 if TYPE_CHECKING:  # `from crewai import LLM` pulls a heavy chain — keep it out of
     from crewai import LLM  # the API process; imported lazily inside build_llm.
+    from crewai.hooks import LLMCallHookContext
+
+
+@cache
+def _register_groq_message_hook() -> None:
+    from crewai.hooks import register_before_llm_call_hook
+
+    def strip_cache_marker(context: LLMCallHookContext) -> None:
+        model = getattr(context.llm, "model", "")
+        if isinstance(model, str) and model.startswith("groq/"):
+            for message in context.messages:
+                # CrewAI marks stable prompt prefixes with a field Groq rejects.
+                message.pop("cache_breakpoint", None)
+
+    register_before_llm_call_hook(strip_cache_marker)
 
 
 def _export_provider_keys() -> None:
@@ -30,6 +46,12 @@ def _export_provider_keys() -> None:
         os.environ.setdefault("GEMINI_API_KEY", settings.google_api_key)
     if settings.groq_api_key:
         os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key)
+    if settings.cloudflare_account_id:
+        os.environ.setdefault("CLOUDFLARE_ACCOUNT_ID", settings.cloudflare_account_id)
+    if settings.cloudflare_api_key:
+        os.environ.setdefault("CLOUDFLARE_API_KEY", settings.cloudflare_api_key)
+    if settings.openrouter_api_key:
+        os.environ.setdefault("OPENROUTER_API_KEY", settings.openrouter_api_key)
     if settings.ollama_api_base:
         os.environ.setdefault("OLLAMA_API_BASE", settings.ollama_api_base)
     # Vertex AI (ADC-authenticated). LiteLLM reads these for `vertex_ai/` models.
@@ -99,6 +121,14 @@ def build_llm(model: str | None = None, temperature: float = 0.4, *, task: str |
 
         model = model_for(task)
     kwargs: dict = {"model": model or settings.model, "temperature": temperature}
+    if kwargs["model"].startswith("groq/"):
+        _register_groq_message_hook()
+        if task in {"extraction", "reviewer", "compact_plan"}:
+            kwargs["response_format"] = {"type": "json_object"}
+        if task == "extraction":
+            kwargs["max_tokens"] = 1024
+        if task in {"extraction", "research", "compact_plan"} and kwargs["model"].startswith("groq/openai/gpt-oss-"):
+            kwargs["reasoning_effort"] = "low"
     # A request timeout stops a single stalled call from hanging the whole run;
     # num_retries lets LiteLLM recover from a transient blip before the error
     # bubbles up to the crew-level retry. Both are no-ops on providers that
@@ -111,6 +141,14 @@ def build_llm(model: str | None = None, temperature: float = 0.4, *, task: str |
         quota_headers = _vertex_quota_headers()
         if quota_headers:
             kwargs["extra_headers"] = quota_headers
+    if kwargs["model"].startswith("groq/") and task in {"research", "planner", "reviewer"}:
+        from .groq_llm import GroqCrewLLM
+
+        return GroqCrewLLM(**kwargs, quota_retries=settings.llm_num_retries)
+    if kwargs["model"].startswith("cloudflare/") and task == "reviewer":
+        from .cloudflare_llm import CloudflareReviewLLM
+
+        return CloudflareReviewLLM(**kwargs)
     return LLM(**kwargs)
 
 
@@ -174,6 +212,15 @@ def stream_call(
         return
 
 
+def rate_limit_retry_delay(exc: Exception, attempt: int) -> float:
+    suggested = re.search(
+        r"(?:retry(?:Delay)?['\":\s]*|try again in\s+)([0-9]+(?:\.[0-9]+)?)\s*s\b",
+        str(exc),
+        re.IGNORECASE,
+    )
+    return float(suggested.group(1)) + 1 if suggested else min(2 ** attempt * 5, 60)
+
+
 def call_with_retry(llm: LLM, prompt: str | list[dict], max_retries: int = 6) -> str:
     """Call an LLM, retrying on free-tier 429 rate-limit errors.
 
@@ -192,16 +239,17 @@ def call_with_retry(llm: LLM, prompt: str | list[dict], max_retries: int = 6) ->
         try:
             return llm.call(prompt)
         except Exception as exc:  # noqa: BLE001 - we re-raise if it's not a 429
-            msg = str(exc)
-            if "429" not in msg and "RESOURCE_EXHAUSTED" not in msg:
+            err = classify_exception(exc)
+            if err.code != ErrorCode.E_LLM_RATE_LIMITED:
                 # Not a rate-limit — map to a safe code rather than leaking the
                 # provider exception upward as a raw string.
-                raise AppError(ErrorCode.E_LLM_UNAVAILABLE, log_detail=msg) from exc
-            if attempt == max_retries - 1:
-                raise AppError(ErrorCode.E_LLM_RATE_LIMITED, log_detail=msg) from exc
-            m = re.search(r"retry(?:Delay)?['\":\s]*([0-9]+(?:\.[0-9]+)?)s", msg)
-            delay = float(m.group(1)) + 1 if m else min(2 ** attempt * 5, 60)
-            time.sleep(delay)
+                raise AppError(ErrorCode.E_LLM_UNAVAILABLE, log_detail=str(exc)) from exc
+            # Groq daily caps cannot recover within a chat turn.
+            if attempt == max_retries - 1 or (
+                "per day" in str(exc).lower() and llm.model.startswith("groq/")
+            ):
+                raise err from exc
+            time.sleep(rate_limit_retry_delay(exc, attempt))
     raise RuntimeError("unreachable")
 
 

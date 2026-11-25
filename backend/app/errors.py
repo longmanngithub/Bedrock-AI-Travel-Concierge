@@ -183,15 +183,20 @@ class AppError(Exception):
 def classify_exception(exc: BaseException) -> AppError:
     """Map an arbitrary low-level exception onto a safe `AppError`.
 
-    Centralises the "429 / RESOURCE_EXHAUSTED" sniffing that is otherwise
-    duplicated in `llm.py`. Anything unrecognised becomes `E_INTERNAL`, so a
+    Recognises rate limits even when providers omit the status from the
+    exception text. Anything unrecognised becomes `E_INTERNAL`, so a
     novel provider exception can never fall through to a raw string.
     """
     if isinstance(exc, AppError):
         return exc
     msg = str(exc)
     lowered = msg.lower()
-    if "429" in msg or "resource_exhausted" in lowered or "rate limit" in lowered:
+    if (
+        getattr(exc, "status_code", None) == 429
+        or "429" in msg
+        or "resource_exhausted" in lowered
+        or "rate limit" in lowered
+    ):
         return AppError(ErrorCode.E_LLM_RATE_LIMITED, log_detail=msg)
     if "timeout" in lowered or "timed out" in lowered:
         return AppError(ErrorCode.E_LLM_TIMEOUT, log_detail=msg)

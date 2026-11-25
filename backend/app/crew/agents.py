@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from crewai import Agent
 
-from ..config import get_settings
+from ..cloudflare_llm import CloudflareReviewLLM
 from ..llm import build_llm
 from .tools import estimate_budget, flight_price_lookup, knowledge_base, places_lookup, web_search
 
@@ -33,20 +33,16 @@ _INJECTION_CAUTION = (
 def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
     """Construct all agents.
 
-    All agents run on the fast `model` by default. If `quality_model` is set,
-    the two quality-critical agents (Planner, Reviewer) use it instead — a
-    speed/quality trade-off that puts the stronger (and slower "thinking")
-    model only where reasoning and reflection matter most.
+    Researchers, planner, and reviewer each use their configured model tier.
+    With no tier overrides or quality model they share the default model.
 
     When `rag_enabled` is False the curated `knowledge_base` (RAG) tool is
     withheld from every agent — the ablation control condition used to isolate
     the knowledge base's contribution (report §8/§11).
     """
-    settings = get_settings()
-    llm = build_llm()
-    quality_llm = (
-        build_llm(model=settings.quality_model) if settings.quality_model else llm
-    )
+    llm = build_llm(task="research")
+    planner_llm = build_llm(task="planner")
+    reviewer_llm = build_llm(task="reviewer")
 
     # In the RAG-ablation condition, drop the knowledge_base tool everywhere.
     def rag(tools: list) -> list:
@@ -185,7 +181,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
             + _INJECTION_CAUTION
         ),
         tools=rag([knowledge_base]),
-        llm=quality_llm,
+        llm=planner_llm,
         verbose=True,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
@@ -210,7 +206,9 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
             "traveller made that the draft never addressed. " + _INJECTION_CAUTION
         ),
         tools=[],  # reflection is pure reasoning over prior agents' outputs
-        llm=quality_llm,
+        llm=reviewer_llm,
+        # The Cloudflare reviewer owns its retry and deadline together.
+        max_retry_limit=0 if isinstance(reviewer_llm, CloudflareReviewLLM) else 2,
         verbose=True,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens

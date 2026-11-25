@@ -20,8 +20,10 @@ from datetime import date, timedelta
 
 from crewai import Crew, Process
 
-from ..schemas import BudgetBreakdown, Itinerary, Source, TripRequest
+from ..errors import AppError
 from ..llm import build_llm
+from ..routing import model_for
+from ..schemas import BudgetBreakdown, Itinerary, Source, TripRequest
 from .agents import build_agents
 from .manifest import STEP_KEYS
 from .progress import (
@@ -74,12 +76,18 @@ def build_crew(
     # siblings, so async execution is only used under the sequential process.
     tasks = build_tasks(agents, allow_async=not hierarchical)
 
+    max_rpm = settings.max_rpm
+    crew_models = [model_for(role) for role in ("research", "planner", "reviewer")]
+    if hierarchical:
+        crew_models.append(settings.manager_model or settings.model)
+    if settings.cloudflare_crew_max_rpm and all(model.startswith("cloudflare/") for model in crew_models):
+        max_rpm = settings.cloudflare_crew_max_rpm
     kwargs: dict = dict(
         agents=list(agents.values()),
         tasks=tasks,
         # Throttle the crew's own LLM calls below the free-tier RPM ceiling so a
         # burst of agent/tool calls doesn't trip a 429 mid-run.
-        max_rpm=settings.max_rpm,
+        max_rpm=max_rpm,
         verbose=verbose,
     )
 
@@ -213,6 +221,27 @@ def _inputs_from_request(
     }
 
 
+def run_compact_itinerary(
+    request: TripRequest, *, model: str, previous: Itinerary | None,
+    progress: ProgressSink, traveller_memory: str | None,
+) -> tuple[Itinerary, float, int]:
+    from ..baseline import run_compact_plan
+
+    progress.check_cancelled()
+    progress.step("planner", "running", "Generating a draft with Groq")
+    itinerary, elapsed, tokens = run_compact_plan(
+        request, model=model, previous=previous, traveller_memory=traveller_memory,
+        weekdays=_weekday_context(request.start_date, request.num_days),
+    )
+    progress.check_cancelled()
+    progress.step("planner", "done", "Draft generated")
+    if previous is not None:
+        _backfill_dropped_fields(itinerary, previous)
+    _reconcile_budget(itinerary, request)
+    progress.step("reviewer", "done", "Checked the daily schedule and budget totals")
+    return itinerary, elapsed, tokens
+
+
 def run_crew(
     request: TripRequest,
     verbose: bool = False,
@@ -303,6 +332,10 @@ def run_crew(
                 # got a chance to match. Re-raise immediately so it does.
                 raise
             except Exception as exc:  # noqa: BLE001
+                # Job-owned runs already have one attempt. Preserve the typed
+                # provider error so the worker can emit its public error code.
+                if isinstance(exc, AppError) and progress is not None:
+                    raise
                 last_exc = exc
                 if attempt < attempts - 1:
                     time.sleep(2)

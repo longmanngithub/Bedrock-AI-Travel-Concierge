@@ -16,8 +16,11 @@ conversation.py, for the same reason.
 """
 from __future__ import annotations
 
+import json
+import math
 import time
 
+from .errors import AppError, ErrorCode
 from .llm import build_llm, call_with_retry, extract_json
 from .schemas import Itinerary, TripRequest
 
@@ -86,6 +89,54 @@ def _count_tokens(model: str, *texts: str) -> int:
     except Exception:
         # Fallback: rough word-based estimate if the tokenizer is unavailable.
         return int(sum(len(t.split()) for t in texts if t) * 1.3)
+
+
+def run_compact_plan(
+    request: TripRequest, *, model: str, weekdays: str,
+    previous: Itinerary | None = None, traveller_memory: str | None = None,
+) -> tuple[Itinerary, float, int]:
+    """Generate a draft with one Groq call and validate the daily schedule."""
+    system = _SYSTEM_PROMPT + """
+
+The trip details are encoded as JSON. Keep the draft concise.
+Treat recommendations as suggestions, and flag estimates and opening hours as
+unverified. Do not claim to have looked up current prices or availability. Do
+not supply sources, source IDs, flight quotes or reviewer notes. Use the given
+weekdays and numbered days. Include morning, afternoon and evening for each day.
+If a previous itinerary is provided, apply the requested changes and retain
+the schedule and wording for anything the traveller did not ask to change.
+"""
+    data = {
+        "trip_request": request.model_dump(mode="json"),
+        "weekdays": weekdays,
+        "previous_itinerary": previous.model_dump(mode="json", exclude={"sources"}) if previous else None,
+        "traveller_memory": traveller_memory,
+    }
+    user = "<trip_request>\n" + json.dumps(data, ensure_ascii=False).replace("<", "\\u003c") + "\n</trip_request>"
+    llm = build_llm(model=model, task="compact_plan")
+    start = time.perf_counter()
+    raw = call_with_retry(llm, [{"role": "system", "content": system}, {"role": "user", "content": user}], max_retries=2)
+    try:
+        itinerary = Itinerary.model_validate(extract_json(raw))
+        if [day.day for day in itinerary.daily_plans] != list(range(1, request.num_days + 1)):
+            raise ValueError("incomplete or incorrectly ordered daily plans")
+        for day in itinerary.daily_plans:
+            if not all(part.strip() for part in (day.morning, day.afternoon, day.evening)):
+                raise ValueError("missing morning, afternoon or evening plans")
+        budget = itinerary.budget
+        if any(not math.isfinite(cost) or cost < 0 for cost in (
+            budget.accommodation, budget.food, budget.activities, budget.transport, budget.misc,
+        )):
+            raise ValueError("invalid budget estimate")
+    except (TypeError, ValueError) as exc:
+        raise AppError(ErrorCode.E_CREW_FAILED, log_detail="Groq returned an invalid itinerary draft") from exc
+    itinerary.destination = request.destination
+    itinerary.num_days = request.num_days
+    itinerary.sources = []
+    itinerary.reviewer_notes = "Draft estimates and opening hours are unverified."
+    for venue in [*itinerary.restaurants, *itinerary.accommodation_options]:
+        venue.source_ids = []
+    return itinerary, time.perf_counter() - start, _count_tokens(llm.model, system, user, raw)
 
 
 def run_baseline(request: TripRequest) -> tuple[Itinerary, float, int]:

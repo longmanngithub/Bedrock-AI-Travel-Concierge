@@ -24,18 +24,17 @@ STEP_MANIFEST: list[dict] = [
 STEP_KEYS: list[str] = [s["key"] for s in STEP_MANIFEST]
 _LABELS: dict[str, str] = {s["key"]: s["label"] for s in STEP_MANIFEST}
 _WEIGHTS: dict[str, int] = {s["key"]: s["weight"] for s in STEP_MANIFEST}
-_TOTAL_WEIGHT: int = sum(_WEIGHTS.values())
 
 
 def label_for(key: str) -> str:
     return _LABELS.get(key, key)
 
 
-def initial_steps() -> list[dict]:
+def initial_steps(*, compact: bool = False) -> list[dict]:
     """A fresh, all-pending checklist."""
     return [
         {"key": s["key"], "label": s["label"], "state": "pending", "detail": ""}
-        for s in STEP_MANIFEST
+        for s in STEP_MANIFEST if not compact or s["key"] in {"planner", "reviewer"}
     ]
 
 
@@ -44,6 +43,5 @@ def percent_from_steps(steps: list[dict]) -> int:
     research steps finish in arbitrary order, so we never emit 'step N of 7' —
     only done_weight / total_weight."""
     done = sum(_WEIGHTS.get(s["key"], 0) for s in steps if s.get("state") == "done")
-    if not _TOTAL_WEIGHT:
-        return 0
-    return int(round(100 * done / _TOTAL_WEIGHT))
+    total = sum(_WEIGHTS.get(s["key"], 0) for s in steps)
+    return int(round(100 * done / total)) if total else 0

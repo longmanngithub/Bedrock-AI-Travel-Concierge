@@ -111,7 +111,7 @@ export default function ResearchProgress({ steps = [], percent = 0, activity = n
             <circle cx="9" cy="9" r="6" />
             <path d="M13.5 13.5L17 17" strokeLinecap="round" />
           </svg>
-          Researching your trip
+          Planning your trip
         </div>
         <span className="text-xs tabular-nums text-muted">{pct}%</span>
       </div>

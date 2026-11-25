@@ -18,10 +18,8 @@ Auth, conversations, and jobs live in app/routers/.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import re
 import uuid
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -49,6 +47,7 @@ from .conversation import (
     build_reply_messages,
     extract_turn,
     latest_previous_record_id,
+    reply_without_model,
 )
 from .database import SessionLocal, check_schema_current, get_db
 from .errors import AppError, ErrorCode, USER_MESSAGES, classify_exception, error_payload
@@ -58,6 +57,7 @@ from .models import Conversation, Message, TripRecord, User
 from .queue.enqueue import enqueue_itinerary
 from .queue.settings import close_arq_pool, get_arq_pool
 from .rate_limit import limiter
+from .routing import model_for
 from .routers.auth import router as auth_router
 from .routers.conversations import router as conversations_router
 from .routers.geo import router as geo_router
@@ -298,10 +298,6 @@ async def _enqueue_plan(
     # async but its DB work is quick).
     db = SessionLocal()
     try:
-        if conversation_id is not None:
-            conversation = db.get(Conversation, conversation_id)
-            if conversation is None or conversation.user_id != user.id:
-                raise AppError(ErrorCode.E_NOT_FOUND, log_detail="conversation not found/owned")
         job_id, created = await enqueue_itinerary(
             db, pool,
             trip_request=trip_request,
@@ -309,29 +305,13 @@ async def _enqueue_plan(
             user_id=user.id,
             conversation_id=conversation_id,
             idempotency_key=idempotency_key,
+            reply_text=reply_text,
         )
     except AppError as exc:
         return {"kind": "error", **error_payload(exc, request_id=request_id)}
     except Exception as exc:  # noqa: BLE001
         err = AppError(ErrorCode.E_QUEUE_UNAVAILABLE, log_detail=str(exc))
         return {"kind": "error", **error_payload(err, request_id=request_id)}
-    else:
-        # Best-effort: the job is already enqueued and will run regardless. A
-        # failure here only costs the "resume after a closed tab" capability
-        # for this one turn, not the plan itself, so it's logged, not raised.
-        if created and conversation_id is not None:
-            try:
-                next_seq = (db.scalar(
-                    select(func.max(Message.seq)).where(Message.conversation_id == conversation_id)
-                ) or 0) + 1
-                db.add(Message(
-                    conversation_id=conversation_id, role="assistant", content=reply_text,
-                    kind="job", job_id=job_id, seq=next_seq,
-                ))
-                db.commit()
-            except Exception as exc:  # noqa: BLE001
-                _logger.warning("job %s: placeholder message insert failed: %s", job_id, exc)
-                db.rollback()
     finally:
         db.close()
 
@@ -361,6 +341,7 @@ async def chat_stream(
         try:
             extraction = await run_in_threadpool(extract_turn, messages, req.location_hint)
         except AppError as exc:
+            _logger.info("chat extraction [req=%s] code=%s", request_id, exc.code.value)
             yield _sse({"kind": "error", **error_payload(exc, request_id=request_id)})
             return
         except Exception as exc:  # noqa: BLE001
@@ -378,30 +359,34 @@ async def chat_stream(
         )
         yield _sse({"kind": "meta", "type": meta_type})
 
-        # Stream the concierge's reply. The reply model is tiered per route
-        # (answer=standard, else cheap).
-        reply_task = "answer" if route == "answer" else "reply"
-        streamed: list[str] = []
-        iterator = stream_call(build_reply_messages(messages, extraction), temperature=0.7, task=reply_task)
-        while True:
-            try:
-                tok = await run_in_threadpool(next, iterator)
-            except StopIteration:
-                break
-            except Exception:  # noqa: BLE001 - streaming is best-effort
-                break
-            tok = strip_emoji(tok)
-            streamed.append(tok)
-            for piece in re.findall(r"\s*\S+", tok):
-                yield _sse({"kind": "token", "text": piece})
-                await asyncio.sleep(0.012)
+        reply_text = reply_without_model(
+            messages,
+            extraction,
+            reuse_extracted=(
+                _settings.groq_reuse_extracted_reply and model_for("extraction").startswith("groq/")
+            ),
+        )
+        if reply_text is None:
+            reply_task = "answer" if route == "answer" else "reply"
+            iterator = stream_call(
+                build_reply_messages(messages, extraction), temperature=0.7, task=reply_task
+            )
+            streamed: list[str] = []
+            while True:
+                token = await run_in_threadpool(next, iterator, None)
+                if token is None:
+                    break
+                token = strip_emoji(token)
+                streamed.append(token)
+                if token:
+                    yield _sse({"kind": "token", "text": token})
+            reply_text = "".join(streamed).strip()
+        else:
+            yield _sse({"kind": "token", "text": reply_text})
 
-        reply_text = "".join(streamed).strip()
         if not reply_text:
             reply_text = extraction.assistant_reply or "Let me help you plan that trip!"
-            for piece in re.findall(r"\s*\S+", reply_text):
-                yield _sse({"kind": "token", "text": piece})
-                await asyncio.sleep(0.02)
+            yield _sse({"kind": "token", "text": reply_text})
 
         if route == "refusal":
             quick_replies = _follow_ups(extraction)

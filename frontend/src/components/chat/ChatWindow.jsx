@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { streamChat, formatError } from "../../lib/api.js";
+import { createReplyReveal } from "../../lib/replyReveal.mjs";
 import { useAuth } from "../../lib/AuthContext.jsx";
 import { useConversations } from "../../lib/ConversationsContext.jsx";
 import MessageList from "./MessageList.jsx";
@@ -9,6 +10,7 @@ import Composer from "./Composer.jsx";
 
 // Maps the streamed meta type onto the message `kind` the UI renders by.
 const KIND_FOR_TYPE = { clarify: "clarify", refusal: "refusal", result: "result" };
+const UNSAVED_ERROR_ID = "unsaved-chat-error";
 
 // A completed itinerary's stored message content is just the short, warm
 // confirmation line Bedrock voiced while building it (never the facts
@@ -44,6 +46,8 @@ export default function ChatWindow({
   initialActiveStructure,
   streaming,
   stagingType,
+  streamError,
+  submissionError,
   isBusy,
   startedAt,
   updateStreamState,
@@ -77,6 +81,8 @@ export default function ChatWindow({
   const composerRef = useRef(null);
   const composerWrapRef = useRef(null);
   const scrollContainerRef = useRef(null);
+  const pendingActions = useRef(new Set());
+  const completedReveals = useRef(new Map());
 
   // handleSend is a plain function, recreated every render, closing over
   // whatever `messages` that render saw. A click always *fires* against the
@@ -120,45 +126,64 @@ export default function ChatWindow({
     setEditingMessageId(null);
   }, [activeId]);
 
-  async function runTurn(convId, historyForApi) {
+  async function runTurn(convId, historyForApi, idempotencyKey = globalThis.crypto?.randomUUID?.()) {
     updateStreamState(convId, {
       isBusy: true,
       stagingType: null,
+      error: null,
+      submissionError: null,
       streaming: { role: "assistant", content: "", kind: undefined },
       startedAt: Date.now(),
     });
 
     const acc = { content: "", type: null };
     const controller = new AbortController();
+    const reveal = createReplyReveal((content) => {
+      updateStreamState(convId, {
+        streaming: { role: "assistant", content, kind: KIND_FOR_TYPE[acc.type] },
+      });
+    }, controller.signal);
     registerStreamController(convId, controller);
-    let settled = false;
+    let terminal;
+    let handedOff = false;
+    let unsavedError = null;
 
-    await streamChat(historyForApi, {
-      signal: controller.signal,
-      conversationId: convId,
-      onMeta: (type) => {
-        acc.type = type;
-        updateStreamState(convId, {
-          stagingType: type,
-          streaming: { role: "assistant", content: acc.content, kind: KIND_FOR_TYPE[type] }
-        });
-      },
-      onToken: (text) => {
-        acc.content += text;
-        updateStreamState(convId, {
-          streaming: { role: "assistant", content: acc.content, kind: KIND_FOR_TYPE[acc.type] }
-        });
-      },
-      onJob: (payload) => {
+    try {
+      await streamChat(historyForApi, {
+        signal: controller.signal,
+        conversationId: convId,
+        idempotencyKey,
+        onMeta: (type) => {
+          acc.type = type;
+          updateStreamState(convId, {
+            stagingType: type,
+            streaming: { role: "assistant", content: acc.content, kind: KIND_FOR_TYPE[type] },
+          });
+        },
+        onToken: (text) => {
+          acc.content += text;
+          reveal.append(text, acc.type === "result");
+        },
+        onJob: (payload) => { terminal ??= { kind: "job", payload }; },
+        onDone: () => {
+          terminal ??= { kind: "done" };
+          if (terminal.kind === "done") completedReveals.current.set(convId, reveal);
+        },
+        onError: (payload) => { terminal ??= { kind: "error", payload }; },
+      });
+
+      if (controller.signal.aborted) return;
+      if (terminal?.kind === "job") {
         // A plannable turn: the crew runs in the BACKGROUND, and the backend
-        // has already persisted a placeholder Message (kind="job") for it —
-        // keep the stream "settled" (the SSE POST is done) and hand off to
-        // attachJob, the same code path a reconnect-after-reload uses.
-        settled = true;
-        attachJob(convId, payload.job_id, payload.message ?? acc.content);
-      },
-      onDone: async () => {
-        settled = true;
+        // has already persisted its placeholder message.
+        clearStreamController(convId, controller);
+        attachJob(convId, terminal.payload.job_id, terminal.payload.message ?? acc.content);
+        handedOff = true;
+        return;
+      }
+      if (terminal?.kind === "done") {
+        await reveal.drain();
+        if (controller.signal.aborted) return;
         // The backend owns completed assistant messages so suggested replies,
         // notification delivery, and reload behavior all share one durable row.
         // Silent: this reconciles a transcript already on screen, so it must
@@ -167,45 +192,50 @@ export default function ChatWindow({
           loadMessages(convId, { silent: true }),
           refreshList({ silent: true }),
         ]);
-        updateStreamState(convId, null);
-        clearStreamController(convId);
-      },
-      onError: async (err) => {
-        settled = true;
-        // Session expired mid-conversation (e.g. the access cookie lapsed
-        // between page load and send): drop the session so the app-wide gate
-        // re-covers the screen, rather than dropping a scary error bubble
-        // into the transcript.
-        if (err?.code === "E_AUTH_REQUIRED") {
-          forceReauth();
-        } else {
-          await appendMessage(convId, {
-            role: "assistant",
-            kind: "error",
-            content: err?.networkError
-              ? "I couldn't reach the planning service — please check your connection and try again."
-              : formatError(err),
-          });
-        }
-        updateStreamState(convId, null);
-        clearStreamController(convId);
-      },
-    });
+        return;
+      }
 
-    // Stream closed without a terminal event (e.g. server dropped): surface it
-    if (!settled && !controller.signal.aborted) {
-      await appendMessage(convId, {
+      reveal.dispose();
+      const err = terminal?.payload;
+      if (err?.code === "E_AUTH_REQUIRED" || err?.code === "E_AUTH_EXPIRED") {
+        forceReauth();
+        return;
+      }
+      const message = {
         role: "assistant",
         kind: "error",
-        content: "The connection closed before I finished — please try again.",
-      });
-      updateStreamState(convId, null);
-      clearStreamController(convId);
+        content: !terminal
+          ? "The connection closed before I finished. Please try again."
+          : err?.networkError
+            ? "I couldn't reach the planning service. Please check your connection and try again."
+            : formatError(err),
+      };
+      try {
+        await appendMessage(convId, message);
+      } catch {
+        unsavedError = { message: { ...message, id: UNSAVED_ERROR_ID }, historyForApi, idempotencyKey };
+      }
+    } finally {
+      reveal.dispose();
+      if (completedReveals.current.get(convId) === reveal) {
+        completedReveals.current.delete(convId);
+      }
+      if (!handedOff && !controller.signal.aborted) {
+        clearStreamController(convId, controller);
+        updateStreamState(convId, unsavedError ? {
+          isBusy: false,
+          startedAt: null,
+          stagingType: null,
+          streaming: null,
+          error: unsavedError,
+        } : null);
+      }
     }
   }
 
   async function handleSend(text) {
-    if (isBusy) return;
+    const action = activeId ?? null;
+    if (isBusy || pendingActions.current.has(action)) return;
     // Defense in depth only — the app-wide gate in AuthProvider already
     // makes this unreachable while signed out (a non-dismissible dialog
     // covers the whole screen until login/register succeeds).
@@ -217,27 +247,35 @@ export default function ChatWindow({
     // Read from the ref, not the closed-over `messages` — see messagesRef's
     // own comment for why the closure can be stale.
     let baseMessages = messagesRef.current;
+    let convId = activeId;
+    pendingActions.current.add(action);
+    try {
+      convId = await ensureActiveConversation();
+      pendingActions.current.add(convId);
 
-    const convId = await ensureActiveConversation();
+      // Drop the old tail only when the edited message is submitted.
+      if (editingMessageId) {
+        await truncateConversation(convId, editingMessageId);
+        const idx = baseMessages.findIndex((m) => m.id === editingMessageId);
+        if (idx !== -1) baseMessages = baseMessages.slice(0, idx);
+        setEditingMessageId(null);
+      }
 
-    // Resending an edited message: only now — at send time, not at the
-    // moment the pencil icon was clicked — do we actually drop the old tail.
-    // Cancelling (Esc) before this point leaves everything untouched.
-    if (editingMessageId) {
-      await truncateConversation(convId, editingMessageId);
-      const idx = baseMessages.findIndex((m) => m.id === editingMessageId);
-      if (idx !== -1) baseMessages = baseMessages.slice(0, idx);
-      setEditingMessageId(null);
+      const userMsg = await appendMessage(convId, { role: "user", content: text });
+      setDraft("");
+      const history = [...baseMessages, userMsg].map((m) => ({
+        role: m.role,
+        content: historyContent(m),
+      }));
+      await runTurn(convId, history);
+    } catch {
+      updateStreamState(convId ?? null, {
+        submissionError: "Couldn't send your message. Please try again.",
+      });
+    } finally {
+      pendingActions.current.delete(action);
+      pendingActions.current.delete(convId);
     }
-
-    setDraft("");
-    const userMsg = await appendMessage(convId, { role: "user", content: text });
-
-    const history = [...baseMessages, userMsg].map((m) => ({
-      role: m.role,
-      content: historyContent(m),
-    }));
-    runTurn(convId, history);
   }
 
   function handlePickQuickReply(messageId, value) {
@@ -266,15 +304,24 @@ export default function ChatWindow({
 
   // Regenerate: drop the given assistant reply and replay the preceding history.
   async function handleRegenerate(messageId) {
-    if (!activeId || isBusy) return;
-    // Same stale-closure concern as handleSend — this history feeds the crew
-    // the same way, so it needs the freshest message set too.
-    const current = messagesRef.current;
-    const idx = current.findIndex((m) => m.id === messageId);
-    if (idx === -1) return;
-    const historyBefore = current.slice(0, idx).map((m) => ({ role: m.role, content: historyContent(m) }));
-    await truncateConversation(activeId, messageId);
-    runTurn(activeId, historyBefore);
+    if (!activeId || isBusy || pendingActions.current.has(activeId)) return;
+    pendingActions.current.add(activeId);
+    try {
+      if (messageId === UNSAVED_ERROR_ID && streamError) {
+        await runTurn(activeId, streamError.historyForApi, streamError.idempotencyKey);
+        return;
+      }
+      const current = messagesRef.current;
+      const idx = current.findIndex((m) => m.id === messageId);
+      if (idx === -1) return;
+      const historyBefore = current.slice(0, idx).map((m) => ({ role: m.role, content: historyContent(m) }));
+      await truncateConversation(activeId, messageId);
+      await runTurn(activeId, historyBefore);
+    } catch {
+      updateStreamState(activeId, { submissionError: "Couldn't retry this response. Please try again." });
+    } finally {
+      pendingActions.current.delete(activeId);
+    }
   }
 
   // Thumbs up/down — a local-only preference toggle; clicking the active choice
@@ -288,12 +335,17 @@ export default function ChatWindow({
 
   const lastMessage = messages[messages.length - 1];
   const activeSuggestions =
-    !streaming && !isBusy && lastMessage?.role === "assistant" && Array.isArray(lastMessage?.quickReplies) &&
+    !streaming && !streamError && !isBusy && lastMessage?.role === "assistant" && Array.isArray(lastMessage?.quickReplies) &&
     lastMessage.quickReplies.length > 0 && !lastMessage?.quickRepliesConsumed
       ? lastMessage
       : null;
 
   async function handleStop() {
+    const reveal = completedReveals.current.get(activeId);
+    if (reveal) {
+      reveal.finish();
+      return;
+    }
     // Direct HTTP stream aborts do not reach a terminal backend frame. Persist
     // the requested feedback locally; queued jobs persist their own stopped
     // placeholder through the cancellation endpoint.
@@ -319,7 +371,7 @@ export default function ChatWindow({
     <div className="relative flex h-full flex-1 flex-col overflow-hidden">
       <MessageList
         messages={messages}
-        streamingMessage={streaming}
+        streamingMessage={streaming || streamError?.message}
         stagingType={stagingType}
         startedAt={startedAt}
         disabled={isBusy}
@@ -336,6 +388,11 @@ export default function ChatWindow({
         initialActiveStructure={initialActiveStructure}
       />
       <div ref={composerWrapRef} className="pointer-events-none absolute inset-x-0 bottom-0">
+        {submissionError && (
+          <p role="alert" className="mx-auto max-w-3xl px-4 text-sm text-ink">
+            {submissionError}
+          </p>
+        )}
         <Composer
           value={draft}
           onChange={setDraft}

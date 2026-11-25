@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     # Provider keys (only the one matching `model` needs to be set).
     google_api_key: str | None = None
     groq_api_key: str | None = None
+    groq_compact_planning: bool = False
+    groq_reuse_extracted_reply: bool = False
+    cloudflare_account_id: str | None = None
+    cloudflare_api_key: str | None = None
+    openrouter_api_key: str | None = None
     ollama_api_base: str | None = None
 
     # Vertex AI (used when MODEL starts with `vertex_ai/`). Auth is via Google
@@ -188,6 +193,7 @@ class Settings(BaseSettings):
     # for the baseline + judge calls that share the same per-minute budget
     # during an evaluation sweep.
     max_rpm: int = 8
+    cloudflare_crew_max_rpm: int | None = Field(default=None, ge=1)
 
     # --- Reliability ---
     # Per-LLM-call request timeout (seconds). Without it a single stalled

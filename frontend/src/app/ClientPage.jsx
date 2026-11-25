@@ -45,24 +45,33 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
   }, []);
 
   const registerStreamController = useCallback((convId, controller) => {
-    streamControllersRef.current[convId]?.abort();
+    const previous = streamControllersRef.current[convId];
+    if (previous?.dispose) previous.dispose();
+    else previous?.abort();
     streamControllersRef.current[convId] = controller;
   }, []);
 
-  const clearStreamController = useCallback((convId) => {
-    delete streamControllersRef.current[convId];
+  const clearStreamController = useCallback((convId, controller) => {
+    if (streamControllersRef.current[convId] === controller) {
+      delete streamControllersRef.current[convId];
+    }
   }, []);
 
   const abortStream = useCallback((convId) => {
-    streamControllersRef.current[convId]?.abort();
-    delete streamControllersRef.current[convId];
+    const controller = streamControllersRef.current[convId];
+    controller?.abort();
+    if (!controller?.dispose) delete streamControllersRef.current[convId];
     updateStreamState(convId, null);
   }, [updateStreamState]);
 
-  // Clean up all requests on unmount
+  // Closing the view unsubscribes from jobs. Stop is the explicit cancellation.
   useEffect(() => {
     return () => {
-      Object.values(streamControllersRef.current).forEach((c) => c.abort());
+      for (const controller of Object.values(streamControllersRef.current)) {
+        if (controller.dispose) controller.dispose();
+        else controller.abort();
+      }
+      streamControllersRef.current = {};
     };
   }, []);
 
@@ -128,10 +137,10 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
         await new Promise((resolve) => setTimeout(resolve, 420));
       }
       if (!dismissed.current) updateStreamState(convId, null);
-      clearStreamController(convId);
+      clearStreamController(convId, controller);
     };
 
-    subscribeJob(jobId, {
+    const unsubscribe = subscribeJob(jobId, {
       onSnapshot: (f) => {
         if (dismissed.current) return;
         progress.steps = f.steps || progress.steps;
@@ -154,7 +163,11 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
       onDone: settle,
       onError: settle,
     });
-    registerStreamController(convId, {
+    const controller = {
+      dispose: () => {
+        dismissed.current = true;
+        unsubscribe();
+      },
       abort: () => {
         // Deliberately does NOT close the SSE subscription — only the tab's
         // own live-progress view is dismissed. `settle` still needs to run
@@ -165,7 +178,8 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
         updateStreamState(convId, null);
         jobsApi.cancel(jobId).then(() => loadMessages(convId, { silent: true })).catch(() => {});
       },
-    });
+    };
+    registerStreamController(convId, controller);
   }, [updateStreamState, registerStreamController, clearStreamController, loadMessages, refreshList]);
 
   // "Close the tab, come back" — reconnect to every job still queued/running
@@ -181,7 +195,7 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
       let live = [];
       try {
         const [running, queued] = await Promise.all([jobsApi.list("running"), jobsApi.list("queued")]);
-        live = [...(running || []), ...(queued || [])];
+        live = [...new Map([...(running || []), ...(queued || [])].map((job) => [job.id, job])).values()];
       } catch {
         return; // best-effort — a failed sweep just means no reconnect this load
       }
@@ -204,7 +218,7 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
         });
       }
     })();
-  }, [loadingList, attachJob]);
+  }, [loadingList, attachJob, loadMessages]);
 
   async function handleNewChat() {
     await startNewChat();
@@ -221,7 +235,10 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
   }
 
   async function handleClearAll() {
-    Object.values(streamControllersRef.current).forEach((c) => c.abort());
+    for (const controller of Object.values(streamControllersRef.current)) {
+      controller.abort();
+      controller.dispose?.();
+    }
     streamControllersRef.current = {};
     setActiveStreams({});
     await clearAll();
@@ -302,6 +319,8 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
           initialHasConversations={initialHasConversations}
           initialActiveStructure={initialActiveStructure}
           streaming={activeStreams[activeId]?.streaming || null}
+          streamError={activeStreams[activeId]?.error || null}
+          submissionError={activeStreams[activeId]?.submissionError || null}
           stagingType={activeStreams[activeId]?.stagingType || null}
           isBusy={activeStreams[activeId]?.isBusy || false}
           startedAt={activeStreams[activeId]?.startedAt || null}
