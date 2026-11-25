@@ -1,16 +1,22 @@
 x-backend-env: &backend-env
-  MODEL: ${MODEL:-vertex_ai/gemini-2.5-flash-lite}
-  JUDGE_MODEL: ${JUDGE_MODEL:-vertex_ai/gemini-2.5-flash-lite}
+  # Groq handles chat and evaluation. The crew uses Cloudflare for planning and review.
+  MODEL: ${MODEL:-groq/openai/gpt-oss-120b}
+  JUDGE_MODEL: ${JUDGE_MODEL:-groq/openai/gpt-oss-120b}
   TIER_CHEAP: ${TIER_CHEAP:-}
-  TIER_STANDARD: ${TIER_STANDARD:-}
-  TIER_QUALITY: ${TIER_QUALITY:-}
-  VERTEXAI_PROJECT: ${VERTEXAI_PROJECT:?set VERTEXAI_PROJECT in .env}
-  VERTEXAI_LOCATION: ${VERTEXAI_LOCATION:-global}
-  GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key.json
+  TIER_STANDARD: ${TIER_STANDARD:-cloudflare/@cf/openai/gpt-oss-120b}
+  TIER_QUALITY: ${TIER_QUALITY:-cloudflare/@cf/zai-org/glm-4.7-flash}
+  TASK_TIERS: ${TASK_TIERS:-extraction=cheap,reply=cheap,answer=cheap,research=quality,planner=quality,reviewer=standard,judge=standard}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+  CLOUDFLARE_API_KEY: ${CLOUDFLARE_API_KEY:-}
+  GROQ_COMPACT_PLANNING: ${GROQ_COMPACT_PLANNING:-false}
+  GROQ_REUSE_EXTRACTED_REPLY: ${GROQ_REUSE_EXTRACTED_REPLY:-false}
+  CLOUDFLARE_CREW_MAX_RPM: ${CLOUDFLARE_CREW_MAX_RPM:-30}
+  REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
   GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
 
   DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}}
-  
+
   REDIS_URL: ${REDIS_URL:-redis://${REDIS_USER:-default}:${REDIS_PASSWORD}@${REDIS_HOST:-localhost}:${REDIS_PORT:-6379}/${REDIS_DB_INDEX:-0}}
 
   # Auth & Security
@@ -59,7 +65,6 @@ services:
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
     volumes:
-      - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
       - concierge_avatars:/var/lib/bedrock/avatars
     expose:
       - "8000"
@@ -77,8 +82,6 @@ services:
     environment:
       <<: *backend-env
       ALEMBIC_SKIP: "1"
-    volumes:
-      - ${GCP_KEY_FILE:-./gcp-key.json}:/app/gcp-key.json:ro
     command: ["arq", "app.queue.worker.WorkerSettings"]
     healthcheck:
       disable: true
