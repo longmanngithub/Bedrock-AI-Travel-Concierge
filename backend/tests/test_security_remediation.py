@@ -1,16 +1,20 @@
+import io
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app import main
 from app.auth.cookies import CSRF_COOKIE
+from app.avatar_storage import LocalAvatarStorage
 from app.database import Base, get_db
 from app.models import EmailVerification, OAuthAccount, RefreshToken, User
-from app.routers import auth
+from app.routers import auth, settings
 
 
 class AccountLifecycleTests(unittest.TestCase):
@@ -53,6 +57,38 @@ class AccountLifecycleTests(unittest.TestCase):
         })
         self.assertEqual(signed_in.status_code, 200, signed_in.json())
         self.assertTrue(signed_in.json()["has_password"])
+
+    def test_avatar_upload_keeps_profile_and_sign_in_available(self):
+        self.activate()
+        picture = io.BytesIO()
+        Image.new("RGB", (16, 16), "teal").save(picture, format="PNG")
+        with TemporaryDirectory() as directory:
+            storage = LocalAvatarStorage(directory)
+            with (
+                patch("app.avatar_storage.get_avatar_storage", return_value=storage),
+                patch.object(settings, "get_avatar_storage", return_value=storage),
+            ):
+                upload = self.client.post(
+                    "/me/avatar",
+                    files={"file": ("avatar.png", picture.getvalue(), "image/png")},
+                    headers={"X-CSRF-Token": self.client.cookies[CSRF_COOKIE]},
+                )
+                self.assertEqual(upload.status_code, 200, upload.text)
+                avatar_url = upload.json()["avatar_url"]
+                self.assertTrue(avatar_url.startswith("/me/avatar?v="))
+                picture_response = self.client.get(avatar_url)
+                self.assertEqual(picture_response.status_code, 200)
+                self.assertEqual(picture_response.headers["Content-Type"], "image/webp")
+
+                profile = self.client.get("/auth/me")
+                self.assertEqual(profile.status_code, 200, profile.text)
+                self.assertEqual(profile.json()["avatar_url"], avatar_url)
+
+                signed_in = self.client.post("/auth/login", json={
+                    "email": self.email, "password": self.password,
+                })
+                self.assertEqual(signed_in.status_code, 200, signed_in.text)
+                self.assertEqual(signed_in.json()["avatar_url"], avatar_url)
 
     def test_refresh_and_logout_require_request_confirmation(self):
         self.activate()
