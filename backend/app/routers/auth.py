@@ -5,7 +5,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, EmailStr, Field
@@ -110,7 +110,10 @@ def _client(request: Request) -> tuple[str | None, str | None]:
 
 def _avatar_url(user: User) -> str | None:
     if user.avatar_key:
-        version = user.avatar_updated_at.isoformat() if user.avatar_updated_at else "0"
+        updated_at = user.avatar_updated_at
+        if updated_at is not None and updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        version = updated_at.astimezone(timezone.utc).isoformat() if updated_at else "0"
         return f"/me/avatar?v={quote(version)}"
     if user.avatar_source == "google" and user.google_avatar_url:
         return user.google_avatar_url
