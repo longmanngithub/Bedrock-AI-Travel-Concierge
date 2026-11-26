@@ -12,15 +12,50 @@ import logging
 import uuid
 from contextvars import ContextVar
 
+from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from .config import get_settings
 
 _request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 logger = logging.getLogger("app")
+
+
+def suppress_provider_url_logging() -> None:
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+class RequestBodyLimitMiddleware:
+    """Cap input bytes before multipart or JSON parsers receive them."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH", "DELETE"}:
+            return await self.app(scope, receive, send)
+        limit = 6 * 1024 * 1024 if scope["path"].rstrip("/") == "/me/avatar" else 2 * 1024 * 1024
+        length = Headers(scope=scope).get("content-length")
+        if length and (not length.isascii() or not length.isdecimal() or len(length) > 20 or int(length) > limit):
+            response = JSONResponse({"code": "E_VALIDATION", "message": "Request body is too large."}, status_code=413)
+            return await response(scope, receive, send)
+
+        size = 0
+
+        async def limited_receive():
+            nonlocal size
+            message = await receive()
+            size += len(message.get("body", b""))
+            if size > limit:
+                raise HTTPException(413, "Request body is too large.")
+            return message
+
+        return await self.app(scope, limited_receive, send)
 
 
 def get_request_id() -> str | None:
@@ -37,8 +72,7 @@ def new_request_id() -> str:
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
-        incoming = request.headers.get("X-Request-Id")
-        rid = (incoming or uuid.uuid4().hex)[:32]
+        rid = uuid.uuid4().hex
         token = _request_id.set(rid)
         try:
             response = await call_next(request)
@@ -65,6 +99,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        if request.cookies.get("ac_access") or request.url.path.startswith("/auth/"):
+            response.headers["Cache-Control"] = "private, no-store"
         if get_settings().cookies_secure:
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         return response

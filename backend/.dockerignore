@@ -6,6 +6,9 @@ __pycache__/
 .env.*
 !.env.example
 app/rag/chroma_store/
+data/
+evaluation/
+**/*key.json
 evaluation/results.csv
 evaluation/results.md
 evaluation/__pycache__/

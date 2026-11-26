@@ -99,7 +99,7 @@ class ItineraryCompletionTests(unittest.IsolatedAsyncioTestCase):
         trip = TripRequest(destination="Bangkok", start_date="2026-12-21", end_date="2026-12-23", budget=1500)
         job = jobs.Job(id=job_id, status=jobs.JobStatus.queued, user_id=user_id)
         job.payload = {"trip_request": trip.model_dump(mode="json")}
-        user = SimpleNamespace(memory_opt_in=False, telegram_chat_id=1, id=user_id)
+        user = SimpleNamespace(memory_opt_in=False, telegram_chat_id=1, telegram_link_revision=0, id=user_id)
         message = SimpleNamespace(conversation_id=uuid.uuid4())
         db = MagicMock()
         db.__enter__.return_value = db
@@ -136,6 +136,7 @@ class ItineraryEnqueueTests(unittest.IsolatedAsyncioTestCase):
         self.trip = TripRequest(destination="Bangkok", start_date="2026-12-21", end_date="2026-12-23", budget=1500)
         self.db = MagicMock()
         self.pool = AsyncMock()
+        self.db.execute.return_value.one.return_value = (1, 1)
 
     async def enqueue(self, reply_text=None):
         return await enqueue_itinerary(
@@ -163,14 +164,13 @@ class ItineraryEnqueueTests(unittest.IsolatedAsyncioTestCase):
         self.db.scalar.return_value = jobs.Job(
             id=job_id, status=jobs.JobStatus.queued, user_id=self.user_id, conversation_id=self.conversation_id,
         )
-        self.pool.enqueue_job.side_effect = [ConnectionError("redis unavailable"), None]
+        self.pool.enqueue_job.side_effect = [RedisConnectionError("redis unavailable"), None]
 
-        with self.assertRaises(ConnectionError):
-            await self.enqueue()
+        self.assertEqual(await self.enqueue(), (job_id, True))
         self.assertEqual(await self.enqueue(), (job_id, False))
         initial, retried = self.pool.enqueue_job.await_args_list
         self.assertEqual(initial, retried)
-        self.assertEqual(retried.kwargs["_job_id"], f"crew:{job_id}")
+        self.assertEqual(retried.kwargs["_job_id"], f"crew:json:{job_id}")
 
     async def test_accepted_replay_never_republishes_a_finished_job(self):
         job_id = uuid.uuid4()

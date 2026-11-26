@@ -49,8 +49,13 @@ async def send_response_email_job(ctx: dict, delivery_id: str) -> None:
         try:
             if record is not None:
                 itinerary = Itinerary(**record.itinerary)
-                trip = TripRequest(**record.request)
+                trip = TripRequest.model_validate(record.request, context={"persisted_trip": True})
                 pdf_bytes = await asyncio.to_thread(render_itinerary_pdf, itinerary, trip)
+                db.refresh(user)
+                if not user.completion_email_opt_in:
+                    delivery.status = "skipped"
+                    db.commit()
+                    return
                 provider_id = await asyncio.to_thread(
                     send_itinerary_email,
                     to_email=user.email,
@@ -62,6 +67,7 @@ async def send_response_email_job(ctx: dict, delivery_id: str) -> None:
                 # Mirrors deliver_itinerary_job's audit shape so the manual
                 # "Email me this PDF" button's mount-time hydration sees this
                 # already sent, rather than offering a redundant duplicate.
+                db.refresh(record, with_for_update=True)
                 record.deliveries = {
                     **(record.deliveries or {}),
                     "email": {

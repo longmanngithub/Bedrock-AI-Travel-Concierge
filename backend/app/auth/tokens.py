@@ -1,7 +1,6 @@
 """Access + refresh tokens.
 
-Access token: short-lived (10 min) HS256 JWT — stateless, checked without a DB
-hit. Refresh token: an opaque 32-byte random (NOT a JWT), stored only as a
+Access token: short-lived (10 min) HS256 JWT backed by a live refresh family. Refresh token: an opaque 32-byte random (NOT a JWT), stored only as a
 sha256 hash. Rotation with reuse detection: each refresh revokes the presented
 token and mints a new one in the same `family_id`; presenting an ALREADY-REVOKED
 token means it leaked, so the whole family is revoked and the user must re-login.
@@ -78,7 +77,19 @@ def issue_refresh_token(
     return raw
 
 
+def family_is_active(db: Session, user_id: uuid.UUID, family_id: uuid.UUID) -> bool:
+    return db.scalar(select(RefreshToken.id).where(
+        RefreshToken.user_id == user_id,
+        RefreshToken.family_id == family_id,
+        RefreshToken.revoked_at.is_(None),
+        RefreshToken.expires_at > datetime.now(timezone.utc),
+    ).limit(1)) is not None
+
+
 def revoke_family(db: Session, family_id: uuid.UUID) -> None:
+    owner = db.scalar(select(RefreshToken.user_id).where(RefreshToken.family_id == family_id).limit(1))
+    if owner is not None:
+        db.execute(select(User.id).where(User.id == owner).with_for_update())
     db.execute(
         update(RefreshToken)
         .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
@@ -88,13 +99,13 @@ def revoke_family(db: Session, family_id: uuid.UUID) -> None:
 
 
 def revoke_all_for_user(db: Session, user_id: uuid.UUID) -> None:
-    """Invalidate every browser session before issuing a password-change session."""
+    """Invalidate every browser session before issuing a replacement session."""
+    db.execute(select(User.id).where(User.id == user_id).with_for_update())
     db.execute(
         update(RefreshToken)
         .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
         .values(revoked_at=datetime.now(timezone.utc))
     )
-    db.commit()
 
 
 def start_session(db: Session, user_id: uuid.UUID, *, ua: str | None, ip: str | None) -> tuple[str, str]:
@@ -151,6 +162,10 @@ def rotate_refresh_token(
     row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
     if row is None:
         raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="unknown refresh token")
+    user = db.get(User, row.user_id, with_for_update=True, populate_existing=True)
+    if user is None or not user.email_verified:
+        raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="inactive refresh owner")
+    db.refresh(row)
     now = datetime.now(timezone.utc)
     already_rotated = row.revoked_at is not None
     if already_rotated:
@@ -181,14 +196,9 @@ def rotate_refresh_token(
     if expires_at < now:
         raise AppError(ErrorCode.E_AUTH_EXPIRED, log_detail="refresh token expired")
 
-    user = db.get(User, row.user_id)
-    if user is None:
-        raise AppError(ErrorCode.E_SESSION_REVOKED, log_detail="user gone")
-
     # Revoke the presented token (if not already), mint a new one in the same family.
     if not already_rotated:
         row.revoked_at = now
-    db.commit()
     access = issue_access_token(user.id, row.family_id)
     refresh = issue_refresh_token(db, user.id, row.family_id, ua=ua, ip=ip)
     return access, refresh, user

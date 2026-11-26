@@ -42,8 +42,6 @@ function historyContent(m) {
 }
 
 export default function ChatWindow({
-  initialHasConversations,
-  initialActiveStructure,
   streaming,
   stagingType,
   streamError,
@@ -384,8 +382,6 @@ export default function ChatWindow({
         scrollContainerRef={scrollContainerRef}
         onScrollStateChange={handleScrollStateChange}
         mounted={mounted}
-        initialHasConversations={initialHasConversations}
-        initialActiveStructure={initialActiveStructure}
       />
       <div ref={composerWrapRef} className="pointer-events-none absolute inset-x-0 bottom-0">
         {submissionError && (

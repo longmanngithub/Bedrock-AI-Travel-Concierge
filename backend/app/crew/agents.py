@@ -63,7 +63,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         tools=rag([knowledge_base, web_search]) + [places_lookup, flight_price_lookup],
         llm=llm,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run
@@ -85,7 +85,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         tools=rag([web_search, knowledge_base]) + [places_lookup],
         llm=llm,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run
@@ -111,7 +111,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         tools=rag([knowledge_base, web_search]),
         llm=llm,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run
@@ -137,7 +137,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         tools=rag([web_search, knowledge_base]) + [places_lookup],
         llm=llm,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run
@@ -158,7 +158,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         tools=[estimate_budget],
         llm=llm,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run
@@ -182,7 +182,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         ),
         tools=rag([knowledge_base]),
         llm=planner_llm,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run
@@ -209,7 +209,7 @@ def build_agents(rag_enabled: bool = True) -> dict[str, Agent]:
         llm=reviewer_llm,
         # The Cloudflare reviewer owns its retry and deadline together.
         max_retry_limit=0 if isinstance(reviewer_llm, CloudflareReviewLLM) else 2,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         # Cap the tool-calling loop so a confused agent can't thrash for dozens
         # of iterations — bounds worst-case latency and improves run-to-run

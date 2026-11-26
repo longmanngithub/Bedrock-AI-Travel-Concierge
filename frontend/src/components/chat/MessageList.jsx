@@ -110,18 +110,6 @@ function ConversationSkeleton({ messages = [] }) {
   );
 }
 
-function parseStructure(structureStr) {
-  if (!structureStr) return [];
-  return structureStr.split(",").map((item, idx) => {
-    const [roleChar, lenStr] = item.split(":");
-    return {
-      id: `skeleton-${idx}`,
-      role: roleChar === "u" ? "user" : "assistant",
-      content: " ".repeat(parseInt(lenStr || "0", 10)),
-    };
-  });
-}
-
 function Welcome({ onPick }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center">
@@ -162,8 +150,6 @@ export default function MessageList({
   scrollContainerRef,
   onScrollStateChange,
   mounted,
-  initialHasConversations,
-  initialActiveStructure,
 }) {
   const lastRowRef = useRef(null);
   const scrollRef = useRef(null);
@@ -310,12 +296,7 @@ export default function MessageList({
   // edit banner, and the textarea's own auto-grow — a static guess is either
   // too tight (content collides with the floating bar) or wastes space.
   if (!mounted) {
-    let structureList = [];
-    if (initialActiveStructure) {
-      structureList = parseStructure(initialActiveStructure);
-    } else if (initialMessages.length > 0) {
-      structureList = initialMessages;
-    }
+    const structureList = initialMessages;
 
     return (
       <div

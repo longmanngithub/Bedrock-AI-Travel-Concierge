@@ -22,7 +22,9 @@ from ..schemas import Itinerary, TripRequest
 logger = logging.getLogger("app.queue.delivery")
 
 
-async def deliver_itinerary_job(ctx: dict, record_id: int, user_id: str, channel: str) -> None:
+async def deliver_itinerary_job(
+    ctx: dict, record_id: int, user_id: str, channel: str, expected_telegram_revision: int | None = None,
+) -> None:
     with SessionLocal() as db:
         record = db.get(TripRecord, record_id)
         user = db.get(User, user_id)
@@ -30,21 +32,27 @@ async def deliver_itinerary_job(ctx: dict, record_id: int, user_id: str, channel
             logger.warning("deliver job: record %s not owned by user %s", record_id, user_id)
             return
 
+        telegram_revision = user.telegram_link_revision if channel == "telegram" else None
+        if expected_telegram_revision is not None and channel == "telegram" and expected_telegram_revision != telegram_revision:
+            return
         try:
             itinerary = Itinerary(**record.itinerary)
-            trip = TripRequest(**record.request)
+            trip = TripRequest.model_validate(record.request, context={"persisted_trip": True})
             loop = asyncio.get_running_loop()
             pdf_bytes = await loop.run_in_executor(None, render_itinerary_pdf, itinerary, trip)
 
+            db.refresh(user)
             if channel == "email":
-                email_delivery.send_itinerary_email(
+                await asyncio.to_thread(
+                    email_delivery.send_itinerary_email,
                     to_email=user.email, itinerary=itinerary, trip=trip, pdf_bytes=pdf_bytes
                 )
                 detail = {"status": "sent", "to": user.email}
             elif channel == "telegram":
-                if user.telegram_chat_id is None:
+                if user.telegram_chat_id is None or user.telegram_link_revision != telegram_revision:
                     raise AppError(ErrorCode.E_DELIVERY_UNAVAILABLE, log_detail="no linked telegram chat")
-                telegram_delivery.send_document(
+                await asyncio.to_thread(
+                    telegram_delivery.send_document,
                     chat_id=user.telegram_chat_id,
                     pdf_bytes=pdf_bytes,
                     filename=f"{itinerary.destination.replace(' ', '_')}_itinerary.pdf",
@@ -58,8 +66,9 @@ async def deliver_itinerary_job(ctx: dict, record_id: int, user_id: str, channel
             logger.warning("delivery failed record=%s channel=%s: %s", record_id, channel, exc.log_detail)
         except Exception as exc:  # noqa: BLE001 - a delivery bug must not crash the worker
             detail = {"status": "failed", "code": ErrorCode.E_INTERNAL.value}
-            logger.exception("delivery job crashed record=%s channel=%s: %s", record_id, channel, exc)
+            logger.error("delivery job crashed record=%s channel=%s (%s)", record_id, channel, type(exc).__name__)
 
         detail["sent_at"] = datetime.now(timezone.utc).isoformat()
+        db.refresh(record, with_for_update=True)
         record.deliveries = {**(record.deliveries or {}), channel: detail}
         db.commit()

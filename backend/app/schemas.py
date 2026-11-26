@@ -65,6 +65,8 @@ class TripRequest(BaseModel):
         start = info.data.get("start_date")
         if start and v < start:
             raise ValueError("end_date must be on or after start_date")
+        if start and (v - start).days >= 31 and not (info.context or {}).get("persisted_trip"):
+            raise ValueError("Trips may span at most 31 calendar days")
         return v
 
     @field_validator("interests", mode="after")

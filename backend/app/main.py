@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from enum import Enum
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -35,8 +36,8 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .auth.cookies import verify_csrf
-from .auth.deps import current_user
+from .auth.cookies import ACCESS_COOKIE, verify_csrf
+from .auth.deps import current_user, session_token_is_active
 from .baseline import run_baseline
 from .config import get_settings
 from .conversation import (
@@ -52,11 +53,15 @@ from .conversation import (
 from .database import SessionLocal, check_schema_current, get_db
 from .errors import AppError, ErrorCode, USER_MESSAGES, classify_exception, error_payload
 from .llm import stream_call, strip_emoji
-from .middleware import RequestIdMiddleware, SecurityHeadersMiddleware, get_request_id
+from .middleware import (
+    RequestBodyLimitMiddleware, RequestIdMiddleware, SecurityHeadersMiddleware,
+    get_request_id, suppress_provider_url_logging,
+)
 from .models import Conversation, Message, TripRecord, User
 from .queue.enqueue import enqueue_itinerary
+from .queue.keys import QUEUE_NAME
 from .queue.settings import close_arq_pool, get_arq_pool
-from .rate_limit import limiter
+from .rate_limit import account_key, limiter
 from .routing import model_for
 from .routers.auth import router as auth_router
 from .routers.conversations import router as conversations_router
@@ -66,10 +71,18 @@ from .routers.settings import router as settings_router
 from .schemas import Itinerary, TripRequest
 
 _settings = get_settings()
+suppress_provider_url_logging()
+limit_generation = limiter.shared_limit("20/hour", scope="generation", key_func=account_key)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if _settings.production and (
+        not _settings.cookies_secure
+        or len(_settings.jwt_secret.encode()) < 32
+        or _settings.jwt_secret.startswith(("change-me", "dev-"))
+    ):
+        raise RuntimeError("Production requires secure cookies and a strong JWT_SECRET")
     # Refuse to serve on a stale schema rather than failing mid-request.
     check_schema_current()
     # Warm the arq pool so the first enqueue isn't slow.
@@ -83,6 +96,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Travel Concierge", version="2.0.0", lifespan=lifespan)
 
+app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -94,7 +108,7 @@ app.add_middleware(
     allow_origins=_settings.allowed_origins_list,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-CSRF-Token", "Last-Event-ID"],
+    allow_headers=["Content-Type", "X-CSRF-Token", "X-Expected-Account", "Last-Event-ID"],
 )
 
 app.state.limiter = limiter
@@ -249,7 +263,7 @@ async def _persist_completed_reply(
         return str(message.id)
     except Exception as exc:  # noqa: BLE001
         db.rollback()
-        _logger.warning("could not persist completed chat response: %s", exc)
+        _logger.warning("could not persist completed chat response (%s)", type(exc).__name__)
         return None
     finally:
         db.close()
@@ -319,11 +333,13 @@ async def _enqueue_plan(
 
 
 @app.post("/chat/stream")
+@limit_generation
 @limiter.limit(_settings.rate_limit_generate)
 async def chat_stream(
     req: ChatRequest,
     request: Request,
     user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """Streaming conversational front door (SSE).
 
@@ -335,11 +351,14 @@ async def chat_stream(
     """
     verify_csrf(request)
     messages = req.messages
+    location_hint = req.location_hint if user.location_share_opt_in else None
+    access_cookie = request.cookies.get(ACCESS_COOKIE)
+    db.close()
     request_id = get_request_id()
 
     async def event_stream():
         try:
-            extraction = await run_in_threadpool(extract_turn, messages, req.location_hint)
+            extraction = await run_in_threadpool(extract_turn, messages, location_hint)
         except AppError as exc:
             _logger.info("chat extraction [req=%s] code=%s", request_id, exc.code.value)
             yield _sse({"kind": "error", **error_payload(exc, request_id=request_id)})
@@ -418,14 +437,29 @@ async def chat_stream(
             frame["message"] = reply_text
         yield _sse(frame)
 
+    async def authorized_stream():
+        next_check = 0.0
+        async with aclosing(event_stream()) as events:
+            async for frame in events:
+                now = time.monotonic()
+                if access_cookie and now >= next_check:
+                    if not await run_in_threadpool(session_token_is_active, access_cookie):
+                        yield _sse({"kind": "error", **error_payload(
+                            AppError(ErrorCode.E_SESSION_REVOKED), request_id=request_id,
+                        )})
+                        return
+                    next_check = now + 5
+                yield frame
+
     return StreamingResponse(
-        event_stream(),
+        authorized_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 @app.post("/chat", response_model=ChatResponse)
+@limit_generation
 @limiter.limit(_settings.rate_limit_generate)
 async def chat(
     req: ChatRequest,
@@ -437,7 +471,7 @@ async def chat(
     fields via the message; kept mainly for parity/testing."""
     verify_csrf(request)
     try:
-        extraction = await run_in_threadpool(extract_turn, req.messages, req.location_hint)
+        extraction = await run_in_threadpool(extract_turn, req.messages, req.location_hint if user.location_share_opt_in else None)
     except Exception as exc:  # noqa: BLE001
         err = classify_exception(exc)
         return ChatResponse(type="error", message=USER_MESSAGES.get(err.code, USER_MESSAGES[ErrorCode.E_INTERNAL]))
@@ -470,6 +504,7 @@ async def chat(
 
 
 @app.post("/itineraries")
+@limit_generation
 @limiter.limit(_settings.rate_limit_generate)
 async def create_itinerary(
     trip_request: TripRequest,
@@ -533,6 +568,7 @@ def _owned_record(record_id: int, user: User, db: Session) -> TripRecord:
 
 
 @app.post("/itineraries/{record_id}/deliver")
+@limiter.limit("6/hour", key_func=account_key)
 async def deliver_itinerary(
     record_id: int, body: DeliverBody, request: Request,
     user: User = Depends(current_user), db: Session = Depends(get_db),
@@ -548,7 +584,12 @@ async def deliver_itinerary(
         raise AppError(ErrorCode.E_DELIVERY_UNAVAILABLE, log_detail="telegram not linked")
 
     pool = await get_arq_pool()
-    await pool.enqueue_job("deliver_itinerary_job", record.id, str(user.id), body.channel)
+    if await pool.zcard(QUEUE_NAME) >= 100:
+        raise AppError(ErrorCode.E_RATE_LIMITED, log_detail="delivery queue capacity reached")
+    await pool.enqueue_job(
+        "deliver_itinerary_job", record.id, str(user.id), body.channel, user.telegram_link_revision,
+        _job_id=f"delivery:{record.id}:{body.channel}",
+    )
     return JSONResponse(status_code=202, content={"status": "queued"})
 
 

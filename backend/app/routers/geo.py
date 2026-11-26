@@ -9,6 +9,7 @@ from ..auth.cookies import verify_csrf
 from ..auth.deps import current_user
 from ..config import get_settings
 from ..geocode import reverse_geocode
+from ..errors import AppError, ErrorCode
 from ..models import User
 from ..rate_limit import limiter
 
@@ -31,4 +32,6 @@ class ReverseGeocodeView(BaseModel):
 @limiter.limit(_settings.rate_limit_geocode)
 def reverse(body: ReverseGeocodeBody, request: Request, user: User = Depends(current_user)) -> ReverseGeocodeView:
     verify_csrf(request)
+    if not user.location_share_opt_in:
+        raise AppError(ErrorCode.E_FORBIDDEN, log_detail="location sharing disabled")
     return ReverseGeocodeView(origin=reverse_geocode(body.lat, body.lon))

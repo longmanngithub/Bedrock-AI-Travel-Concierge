@@ -8,6 +8,7 @@ itself.
 """
 from __future__ import annotations
 
+from starlette.requests import Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -16,4 +17,9 @@ from .config import get_settings
 # Redis-backed (not the slowapi default of in-memory) so limits are shared
 # across uvicorn worker processes (see WEB_CONCURRENCY) and survive a
 # redeploy, using the same Redis instance the arq queue already depends on.
+def account_key(request: Request) -> str:
+    account = getattr(request.state, "account_id", None)
+    return f"account:{account}" if account is not None else get_remote_address(request)
+
+
 limiter = Limiter(key_func=get_remote_address, storage_uri=get_settings().redis_url)

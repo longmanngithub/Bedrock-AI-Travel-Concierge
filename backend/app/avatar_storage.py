@@ -56,6 +56,7 @@ class R2AvatarStorage:
             raise AppError(ErrorCode.E_DELIVERY_UNAVAILABLE, log_detail="R2 avatar configuration incomplete")
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:
             raise AppError(ErrorCode.E_INTERNAL, log_detail="boto3 unavailable for R2") from exc
         self.bucket = settings.r2_bucket
@@ -65,6 +66,7 @@ class R2AvatarStorage:
             aws_access_key_id=settings.r2_access_key_id,
             aws_secret_access_key=settings.r2_secret_access_key,
             region_name="auto",
+            config=Config(request_checksum_calculation="when_required", response_checksum_validation="when_required"),
         )
 
     def put(self, key: str, content: bytes) -> None:
@@ -97,9 +99,9 @@ def normalise_avatar(raw: bytes) -> bytes:
     if not raw or len(raw) > MAX_AVATAR_BYTES:
         raise AppError(ErrorCode.E_VALIDATION, log_detail="avatar size invalid")
     try:
-        with Image.open(io.BytesIO(raw)) as image:
+        with Image.open(io.BytesIO(raw), formats=("JPEG", "PNG", "WEBP")) as image:
             image.verify()
-        with Image.open(io.BytesIO(raw)) as image:
+        with Image.open(io.BytesIO(raw), formats=("JPEG", "PNG", "WEBP")) as image:
             if image.width * image.height > MAX_AVATAR_PIXELS:
                 raise AppError(ErrorCode.E_VALIDATION, log_detail="avatar dimensions invalid")
             # Re-encoding removes metadata and makes every stored object a

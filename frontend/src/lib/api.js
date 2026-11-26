@@ -38,7 +38,13 @@ function getClientId() {
 // through every call site, mirroring setAuthLostHandler below — AuthContext
 // can't import this module's React-consuming callers, so it pushes state in.
 let _locationHint = null;
-export function setLocationHint(hint) {
+let _activeAccount = null;
+export function setActiveAccount(account) {
+  if (_activeAccount !== account) _locationHint = null;
+  _activeAccount = account;
+}
+export function setLocationHint(hint, account = _activeAccount) {
+  if (account !== _activeAccount) return;
   _locationHint = hint || null;
 }
 
@@ -73,7 +79,7 @@ export function setAuthLostHandler(fn) {
   _onAuthLost = fn;
 }
 
-const _AUTH_ERROR_CODES = new Set(["E_AUTH_REQUIRED", "E_AUTH_EXPIRED"]);
+const _AUTH_ERROR_CODES = new Set(["E_AUTH_REQUIRED", "E_AUTH_EXPIRED", "E_SESSION_REVOKED"]);
 // Never intercept these — refreshing to retry a login/register/refresh call
 // itself would loop.
 const _NO_REFRESH_PATHS = new Set(["/auth/refresh", "/auth/login", "/auth/register", "/auth/logout"]);
@@ -95,8 +101,9 @@ function refreshOnce() {
 
 // The actual fetch, with no retry logic — refreshOnce() calls this directly
 // so refreshing never recurses into the retry path above it.
-async function rawFetch(path, { method = "GET", body, signal } = {}) {
+async function rawFetch(path, { method = "GET", body, signal, expectedAccount } = {}) {
   const headers = { "Content-Type": "application/json" };
+  if (expectedAccount) headers["X-Expected-Account"] = expectedAccount;
   if (method !== "GET" && method !== "HEAD") headers["X-CSRF-Token"] = csrfToken();
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
@@ -123,6 +130,7 @@ async function apiFetch(path, opts = {}, _retried = false) {
   try {
     return await rawFetch(path, opts);
   } catch (err) {
+    if (opts.signal?.aborted || (opts.expectedAccount && opts.expectedAccount !== _activeAccount)) throw err;
     const canRetry = !_retried && _AUTH_ERROR_CODES.has(err?.code) && !_NO_REFRESH_PATHS.has(path);
     if (!canRetry) {
       if (_AUTH_ERROR_CODES.has(err?.code)) _onAuthLost?.();
@@ -157,9 +165,9 @@ async function apiFormFetch(path, formData) {
 // ---- Auth -----------------------------------------------------------------
 export const auth = {
   me: () => apiFetch("/auth/me"),
-  register: (email, password, display_name) =>
-    apiFetch("/auth/register", { method: "POST", body: { email, password, display_name } }),
-  verifyEmail: (email, code) => apiFetch("/auth/verify-email", { method: "POST", body: { email, code } }),
+  register: (email) => apiFetch("/auth/register", { method: "POST", body: { email } }),
+  verifyEmail: (email, code, password) =>
+    apiFetch("/auth/verify-email", { method: "POST", body: { email, code, password } }),
   resendVerification: (email) => apiFetch("/auth/verify-email/resend", { method: "POST", body: { email } }),
   login: (email, password) => apiFetch("/auth/login", { method: "POST", body: { email, password } }),
   changePassword: (current_password, new_password, confirm_new_password) =>
@@ -173,22 +181,42 @@ export const auth = {
   // truly gone, that surfaces reactively the next time a real user action
   // hits a 401 and apiFetch's own retry-with-refresh is exhausted.
   silentRefresh: () => rawFetch("/auth/refresh", { method: "POST" }),
-  googleStartUrl: (intent = "login") => `${BASE_URL}/auth/google/start?intent=${intent}`,
+  googleStartUrl: () => `${BASE_URL}/auth/google/start`,
+  linkGoogle: (password) => apiFetch("/auth/google/link", { method: "POST", body: { password } }),
   unlinkGoogle: () => apiFetch("/auth/google/unlink", { method: "POST" }),
 };
 
 // ---- Conversations --------------------------------------------------------
 export const conversations = {
-  list: () => apiFetch("/conversations"),
+  list: async ({ signal } = {}) => {
+    const rows = [];
+    while (true) {
+      const page = await apiFetch(`/conversations?offset=${rows.length}`, { signal });
+      rows.push(...page);
+      if (page.length < 100) return rows;
+    }
+  },
   create: (title = "") => apiFetch("/conversations", { method: "POST", body: { title } }),
-  messages: (id) => apiFetch(`/conversations/${id}/messages`),
+  messages: async (id, { signal } = {}) => {
+    let before;
+    const pages = [];
+    while (true) {
+      const query = before == null ? "" : `?before=${before}`;
+      const page = await apiFetch(`/conversations/${id}/messages${query}`, { signal });
+      pages.push(page);
+      if (page.length < 100) return pages.reverse().flat();
+      before = page[0].seq;
+    }
+  },
   appendMessage: (id, msg) => apiFetch(`/conversations/${id}/messages`, { method: "POST", body: msg }),
   // Deletes fromMessageId and everything after it (by seq) — backs edit/regenerate.
   truncateFrom: (id, messageId) => apiFetch(`/conversations/${id}/messages/${messageId}`, { method: "DELETE" }),
   rename: (id, title) => apiFetch(`/conversations/${id}`, { method: "PATCH", body: { title } }),
   remove: (id) => apiFetch(`/conversations/${id}`, { method: "DELETE" }),
   clearAll: () => apiFetch("/conversations", { method: "DELETE" }),
-  import: (payload) => apiFetch("/conversations/import", { method: "POST", body: payload }),
+  import: (payload, expectedAccount, signal) => apiFetch("/conversations/import", {
+    method: "POST", body: payload, expectedAccount, signal,
+  }),
 };
 
 // ---- Jobs -----------------------------------------------------------------
@@ -223,7 +251,9 @@ export const settings = {
 
 // ---- Location sharing (opt-in flight-origin detection) --------------------
 export const geo = {
-  reverseGeocode: (lat, lon) => apiFetch("/geo/reverse", { method: "POST", body: { lat, lon } }),
+  reverseGeocode: (lat, lon, signal, expectedAccount) => apiFetch("/geo/reverse", {
+    method: "POST", body: { lat, lon }, signal, expectedAccount,
+  }),
 };
 
 // Subscribe to a job's resumable progress stream. Returns an unsubscribe fn.
@@ -314,17 +344,20 @@ export function subscribeJob(jobId, { onSnapshot, onStep, onActivity, onDone, on
 }
 
 // ---- Chat stream ----------------------------------------------------------
-function _postChatStream(messages, conversationId, idempotencyKey, signal) {
+function _postChatStream(messages, conversationId, idempotencyKey, signal, expectedAccount, locationHint) {
   return fetch(`${BASE_URL}/chat/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
+    headers: {
+      "Content-Type": "application/json", "X-CSRF-Token": csrfToken(),
+      ...(expectedAccount ? { "X-Expected-Account": expectedAccount } : {}),
+    },
     credentials: "include",
     body: JSON.stringify({
       messages: messages.map(({ role, content }) => ({ role, content })),
       client_id: getClientId(),
       conversation_id: conversationId || null,
       idempotency_key: idempotencyKey || (typeof crypto !== "undefined" ? crypto.randomUUID() : null),
-      location_hint: _locationHint,
+      location_hint: locationHint,
     }),
     signal,
   });
@@ -335,14 +368,18 @@ export async function streamChat(
   { signal, conversationId, idempotencyKey, onMeta, onToken, onDone, onJob, onError } = {}
 ) {
   let res;
+  const account = _activeAccount;
+  const location = _locationHint;
   try {
-    res = await _postChatStream(messages, conversationId, idempotencyKey, signal);
+    res = await _postChatStream(messages, conversationId, idempotencyKey, signal, account, location);
     // The access cookie is short-lived by design (see api.js's silent-refresh
     // comment) — a turn started after 10+ idle minutes shouldn't force a full
     // re-login. Refresh once and retry the POST before giving up.
-    if (res.status === 401) {
+    if (res.status === 401 && account === _activeAccount && !signal?.aborted) {
       const refreshed = await refreshOnce();
-      if (refreshed) res = await _postChatStream(messages, conversationId, idempotencyKey, signal);
+      if (refreshed && account === _activeAccount) {
+        res = await _postChatStream(messages, conversationId, idempotencyKey, signal, account, location);
+      }
     }
   } catch (e) {
     if (e?.name === "AbortError") return;
@@ -358,7 +395,7 @@ export async function streamChat(
       /* non-JSON */
     }
     const err = data && data.code ? data : { code: "E_INTERNAL", message: "Something went wrong. Please try again." };
-    if (_AUTH_ERROR_CODES.has(err.code)) _onAuthLost?.();
+    if (account === _activeAccount && _AUTH_ERROR_CODES.has(err.code)) _onAuthLost?.();
     onError?.(err);
     return;
   }
@@ -393,6 +430,7 @@ export async function streamChat(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (account !== _activeAccount) { await reader.cancel(); break; }
       buffer += decoder.decode(value, { stream: true });
       let sep;
       while ((sep = buffer.indexOf("\n\n")) !== -1) {

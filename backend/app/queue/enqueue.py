@@ -9,10 +9,13 @@ The client generates the key ONCE per send and reuses it on network retry.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 
+from redis.exceptions import RedisError
+
 from arq.connections import ArqRedis
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -20,6 +23,8 @@ from ..errors import AppError, ErrorCode
 from ..models import Conversation, Job, JobStatus, Message
 from ..schemas import TripRequest
 from . import keys
+
+logger = logging.getLogger(__name__)
 
 
 async def enqueue_itinerary(
@@ -34,6 +39,9 @@ async def enqueue_itinerary(
     reply_text: str | None = None,
 ) -> tuple[uuid.UUID, bool]:
     """Return (job_id, was_created) and recover a missed queue publish on retry."""
+    # Serialize admission only until the durable commit. Idempotent replays
+    # return the existing row even when the queue has reached capacity.
+    db.execute(text("SELECT pg_advisory_xact_lock(1733021810)"))
     create_placeholder = conversation_id is not None and reply_text is not None
     if create_placeholder:
         owned_conversation = db.scalar(
@@ -68,6 +76,14 @@ async def enqueue_itinerary(
     was_created = inserted_id is not None
     if was_created:
         job_id = inserted_id
+        total, per_account = db.execute(
+            select(func.count(), func.count().filter(Job.user_id == user_id)).where(
+                Job.status.in_((JobStatus.queued, JobStatus.running)),
+            )
+        ).one()
+        if total > 100 or (user_id is not None and per_account > 4):
+            db.rollback()
+            raise AppError(ErrorCode.E_RATE_LIMITED, log_detail="planner queue capacity reached")
     else:
         existing = db.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
         if existing is None or existing.user_id != user_id or existing.conversation_id != conversation_id:
@@ -92,5 +108,8 @@ async def enqueue_itinerary(
     # A database commit can succeed before Redis does. Re-publish a still-
     # queued job on retry using the original arq ID, which deduplicates a
     # publish that already reached Redis.
-    await pool.enqueue_job("run_itinerary_job", str(job_id), _job_id=keys.arq_job_id(str(job_id)))
+    try:
+        await pool.enqueue_job("run_itinerary_job", str(job_id), _job_id=keys.arq_job_id(str(job_id)))
+    except RedisError:
+        logger.warning("Job %s accepted in PostgreSQL, awaiting queue recovery", job_id)
     return job_id, was_created

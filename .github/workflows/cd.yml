@@ -1,62 +1,75 @@
 name: CD (deploy to DigitalOcean)
 
-# Runs after CI succeeds on main. SSHes into the droplet, pulls the latest
-# code, and rebuilds/restarts the prod stack in place. This is the
-# git-pull-and-rebuild-on-the-host style of deploy — no container registry
-# required, which keeps setup simple for a prototype/testing deployment.
-#
-# Required repo secrets (see DEPLOYMENT.md for how to create them):
-#   DROPLET_HOST     - droplet IP or domain
-#   DROPLET_USER     - SSH user (e.g. deploy, or root)
-#   DROPLET_SSH_KEY  - private key with access to the droplet (PEM contents)
-#   DROPLET_SSH_PORT - optional, defaults to 22
-#   DEPLOY_PATH      - optional, defaults to ~/ai-agent
-#
-# Until these secrets exist, this workflow's job is skipped rather than
-# failing loudly — safe to merge before the droplet/repo are set up.
 on:
   workflow_run:
     workflows: ["CI"]
     branches: [main]
     types: [completed]
-  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
     if: >
-      ${{ (github.event_name == 'workflow_dispatch' ||
-           github.event.workflow_run.conclusion == 'success') &&
-          vars.DEPLOY_ENABLED != 'false' }}
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      vars.DEPLOY_ENABLED != 'false'
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Check deploy secrets are configured
-        id: check
-        run: |
-          if [ -z "${{ secrets.DROPLET_HOST }}" ] || [ -z "${{ secrets.DROPLET_USER }}" ] || [ -z "${{ secrets.DROPLET_SSH_KEY }}" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::DROPLET_HOST / DROPLET_USER / DROPLET_SSH_KEY not set yet — skipping deploy. See DEPLOYMENT.md."
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Deploy over SSH
-        if: steps.check.outputs.configured == 'true'
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.DROPLET_HOST }}
-          username: ${{ secrets.DROPLET_USER }}
-          key: ${{ secrets.DROPLET_SSH_KEY }}
-          port: ${{ secrets.DROPLET_SSH_PORT || 22 }}
-          script_stop: true
-          envs: DEPLOY_PATH
-          script: |
-            set -e
-            cd "${DEPLOY_PATH:-$HOME/ai-agent}"
-            git fetch origin main
-            git checkout main
-            git reset --hard origin/main
-            docker compose -f docker-compose.prod.yml up -d --build
-            docker image prune -f
+      - name: Deploy the validated revision over SSH
+        shell: bash
         env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          SSH_HOST: ${{ secrets.DROPLET_HOST }}
+          SSH_USER: ${{ secrets.DROPLET_USER }}
+          SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          SSH_PORT: ${{ secrets.DROPLET_SSH_PORT || '22' }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DROPLET_SSH_KNOWN_HOSTS }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SSH_HOST" || -z "$SSH_USER" || -z "$SSH_KEY" ]]; then
+            echo "::warning::Deployment credentials are missing. Skipping deploy."
+            exit 0
+          fi
+          if [[ -z "$SSH_KNOWN_HOSTS" ]]; then
+            echo "::error::Set DROPLET_SSH_KNOWN_HOSTS to the verified server host key."
+            exit 1
+          fi
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9.:][a-zA-Z0-9.:-]*$ ]]
+          [[ "$SSH_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          printf '%s\n' "$SSH_KEY" > "$ssh_dir/key"
+          encoded_path=$(printf '%s' "${DEPLOY_PATH:-ai-agent}" | base64 -w 0)
+          ssh -p "$SSH_PORT" -i "$ssh_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            -- "$SSH_USER@$SSH_HOST" "bash -s -- $DEPLOY_SHA $encoded_path" <<'REMOTE'
+          set -euo pipefail
+          sha="$1"
+          deploy_path=$(printf '%s' "$2" | base64 -d)
+          if [[ "$deploy_path" == "~/"* ]]; then deploy_path="$HOME/${deploy_path:2}"; fi
+          cd "$deploy_path"
+          git fetch origin main
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$sha" ]]; then
+            echo "A newer revision reached main. Skipping stale deployment."
+            exit 0
+          fi
+          if ! git status --porcelain --untracked-files=no | diff -q /dev/null -; then
+            echo "Deployment checkout contains tracked changes."
+            exit 1
+          fi
+          git checkout --detach "$sha"
+          docker compose -f docker-compose.prod.yml up -d --build --wait
+          REMOTE

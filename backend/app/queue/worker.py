@@ -12,6 +12,7 @@ exactly once, before any job runs.
 """
 from __future__ import annotations
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,12 +20,16 @@ from arq import cron
 
 from ..config import get_settings
 from .delivery import deliver_itinerary_job
-from .jobs import reap_stale_jobs, run_itinerary_job
+from .jobs import recover_queued_jobs, reap_stale_jobs, run_itinerary_job
 from .notifications import send_response_email_job
-from .settings import redis_settings, sync_redis
+from .keys import QUEUE_NAME
+from .settings import redis_settings, serialize_job, sync_redis
 from .telegram_poll import poll_telegram_updates
 
+from ..middleware import suppress_provider_url_logging
+
 logging.basicConfig(level=logging.INFO)
+suppress_provider_url_logging()
 logger = logging.getLogger("app.queue.worker")
 
 
@@ -66,6 +71,7 @@ async def shutdown(ctx: dict) -> None:
 class WorkerSettings:
     functions = [run_itinerary_job, deliver_itinerary_job, send_response_email_job]
     cron_jobs = [
+        cron(recover_queued_jobs, second=30),
         cron(reap_stale_jobs, second=0),
         # Telegram linking latency: how long a user waits after tapping the
         # deep link before the bot confirms. is_configured() gates this to a
@@ -75,6 +81,9 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = redis_settings()
+    queue_name = QUEUE_NAME
+    job_serializer = staticmethod(serialize_job)
+    job_deserializer = staticmethod(json.loads)
     max_jobs = get_settings().worker_max_jobs
     job_timeout = int(get_settings().job_timeout)
     max_tries = 2

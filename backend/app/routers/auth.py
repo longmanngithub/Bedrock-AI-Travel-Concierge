@@ -2,20 +2,22 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, EmailStr, Field
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import google
 from ..auth.cookies import (
-    REFRESH_COOKIE,
+    ACCESS_COOKIE,
     clear_auth_cookies,
     refresh_cookie_candidates,
     set_auth_cookies,
@@ -30,6 +32,9 @@ from ..auth.passwords import (
     verify_password_or_dummy,
 )
 from ..auth.tokens import (
+    _hash_token,
+    decode_access_token,
+    revoke_family,
     pick_live_refresh_token,
     revoke_all_for_user,
     rotate_refresh_token,
@@ -42,7 +47,7 @@ from ..delivery.email import send_verification_email
 from ..errors import AppError, ErrorCode
 from ..middleware import get_request_id
 from ..models import OAuthAccount, RefreshToken, User
-from ..rate_limit import limiter
+from ..rate_limit import account_key, limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 _logger = logging.getLogger("app")
@@ -51,8 +56,6 @@ _settings = get_settings()
 
 class RegisterBody(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=1, max_length=200)
-    display_name: str | None = Field(default=None, max_length=120)
 
 
 class LoginBody(BaseModel):
@@ -63,6 +66,11 @@ class LoginBody(BaseModel):
 class VerifyEmailBody(BaseModel):
     email: EmailStr
     code: str = Field(min_length=6, max_length=6)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class GoogleLinkBody(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
 
 
 class ResendVerificationBody(BaseModel):
@@ -159,9 +167,9 @@ def _send_activation_code(db: Session, user: User, *, enforce_cooldown: bool) ->
 
 
 @router.post("/register", response_model=VerificationView)
-def register(body: RegisterBody, db: Session = Depends(get_db)) -> VerificationView:
+@limiter.limit(_settings.rate_limit_login)
+def register(body: RegisterBody, request: Request, db: Session = Depends(get_db)) -> VerificationView:
     email = body.email.lower().strip()
-    validate_password_policy(body.password)
     user = db.scalar(select(User).where(User.email == email))
     if user is not None:
         if user.email_verified:
@@ -170,20 +178,27 @@ def register(body: RegisterBody, db: Session = Depends(get_db)) -> VerificationV
         # than create a second account. It never gets a session here.
         _send_activation_code(db, user, enforce_cooldown=True)
         return VerificationView(email=user.email)
-    user = User(email=email, password_hash=hash_password(body.password), display_name=body.display_name)
+    user = User(email=email)
     db.add(user)
-    db.commit()
-    db.refresh(user)
-    _send_activation_code(db, user, enforce_cooldown=False)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        user = db.scalar(select(User).where(User.email == email))
+        if user is None:
+            raise
+    _send_activation_code(db, user, enforce_cooldown=True)
     return VerificationView(email=user.email)
 
 
 @router.post("/verify-email", response_model=UserView)
+@limiter.limit(_settings.rate_limit_login)
 def verify_email(body: VerifyEmailBody, request: Request, response: Response, db: Session = Depends(get_db)) -> UserView:
     user = db.scalar(select(User).where(User.email == body.email.lower().strip()))
     if user is None:
         raise AppError(ErrorCode.E_VERIFICATION_INVALID, log_detail="verification user missing")
-    verify_registration_code(db, user, body.code)
+    validate_password_policy(body.password)
+    verify_registration_code(db, user, body.code, body.password)
     ua, ip = _client(request)
     access, refresh = start_session(db, user.id, ua=ua, ip=ip)
     set_auth_cookies(response, access, refresh)
@@ -191,7 +206,8 @@ def verify_email(body: VerifyEmailBody, request: Request, response: Response, db
 
 
 @router.post("/verify-email/resend", response_model=VerificationView)
-def resend_verification(body: ResendVerificationBody, db: Session = Depends(get_db)) -> VerificationView:
+@limiter.limit(_settings.rate_limit_login)
+def resend_verification(body: ResendVerificationBody, request: Request, db: Session = Depends(get_db)) -> VerificationView:
     user = db.scalar(select(User).where(User.email == body.email.lower().strip()))
     if user is None or user.email_verified:
         raise AppError(ErrorCode.E_VERIFICATION_INVALID, log_detail="verification resend user unavailable")
@@ -204,6 +220,8 @@ def resend_verification(body: ResendVerificationBody, db: Session = Depends(get_
 def login(body: LoginBody, request: Request, response: Response, db: Session = Depends(get_db)) -> UserView:
     email = body.email.lower().strip()
     user = db.scalar(select(User).where(User.email == email))
+    if user is not None:
+        db.refresh(user, with_for_update=True)
     # Always pays the same Argon2id cost whether or not `user`/its password
     # hash exists, so response timing can't be used to enumerate accounts.
     if not verify_password_or_dummy(body.password, user.password_hash if user else None):
@@ -213,7 +231,6 @@ def login(body: LoginBody, request: Request, response: Response, db: Session = D
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(body.password)
     user.last_login_at = datetime.now(timezone.utc)
-    db.commit()
     ua, ip = _client(request)
     access, refresh = start_session(db, user.id, ua=ua, ip=ip)
     set_auth_cookies(response, access, refresh)
@@ -229,6 +246,7 @@ def change_password(
     db: Session = Depends(get_db),
 ) -> UserView:
     verify_csrf(request)
+    db.refresh(user, with_for_update=True)
     if user.password_hash is None:
         raise AppError(ErrorCode.E_FORBIDDEN, log_detail="password change for oauth-only account")
     if body.new_password != body.confirm_new_password:
@@ -239,7 +257,6 @@ def change_password(
         raise AppError(ErrorCode.E_AUTH_INVALID, log_detail="password change current mismatch")
     validate_password_policy(body.new_password)
     user.password_hash = hash_password(body.new_password)
-    db.commit()
     revoke_all_for_user(db, user.id)
     ua, ip = _client(request)
     access, refresh = start_session(db, user.id, ua=ua, ip=ip)
@@ -249,6 +266,7 @@ def change_password(
 
 @router.post("/refresh", response_model=UserView)
 def refresh(request: Request, response: Response, db: Session = Depends(get_db)) -> UserView:
+    verify_csrf(request)
     # May legitimately be more than one during the legacy "/auth"-path cookie
     # migration; pick the live one rather than letting header order decide.
     raw = pick_live_refresh_token(db, refresh_cookie_candidates(request))
@@ -264,16 +282,25 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
 
 @router.post("/logout")
 def logout(request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
-    from ..auth.tokens import _hash_token, revoke_family
+    verify_csrf(request)
 
     # Revoke every family the presented cookies point at, not just whichever
     # one header order happened to surface — during the legacy-path migration
     # a stale duplicate would otherwise leave the live session alive after a
     # logout the user explicitly asked for.
+    families = set()
+    access = request.cookies.get(ACCESS_COOKIE)
+    if access:
+        try:
+            families.add(decode_access_token(access).family_id)
+        except AppError:
+            pass
     for raw in refresh_cookie_candidates(request):
         row = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == _hash_token(raw)))
         if row is not None:
-            revoke_family(db, row.family_id)
+            families.add(row.family_id)
+    for family in families:
+        revoke_family(db, family)
     clear_auth_cookies(response)
     return {"ok": True}
 
@@ -286,6 +313,7 @@ def me(user: User = Depends(current_user), db: Session = Depends(get_db)) -> Use
 _STATE_COOKIE = "ac_oauth_state"
 _VERIFIER_COOKIE = "ac_oauth_verifier"
 _INTENT_COOKIE = "ac_oauth_intent"
+_LINK_SESSION_COOKIE = "ac_oauth_link_session"
 
 
 def _oauth_cookie_path() -> str:
@@ -299,22 +327,41 @@ def _oauth_cookie_path() -> str:
     return callback_path.rsplit("/", 1)[0] or "/"
 
 
-@router.get("/google/start")
-def google_start(request: Request, intent: str = "login", db: Session = Depends(get_db)) -> RedirectResponse:
+def _set_oauth_flow(response: Response, request: Request, *, link: bool) -> str:
     if not google.is_configured():
         raise AppError(ErrorCode.E_OAUTH_FAILED, log_detail="google oauth not configured")
-    intent = "link" if intent == "link" else "login"
-    if intent == "link" and optional_user(request, db) is None:
-        raise AppError(ErrorCode.E_AUTH_REQUIRED, log_detail="link intent without session")
-    settings = get_settings()
     state = uuid.uuid4().hex
     verifier, challenge = google.make_pkce()
-    redirect = RedirectResponse(google.authorization_url(state, challenge), status_code=302)
-    common = dict(httponly=True, secure=settings.cookies_secure, samesite="lax", max_age=600, path=_oauth_cookie_path())
-    redirect.set_cookie(_STATE_COOKIE, state, **common)
-    redirect.set_cookie(_VERIFIER_COOKIE, verifier, **common)
-    redirect.set_cookie(_INTENT_COOKIE, intent, **common)
-    return redirect
+    common = dict(
+        httponly=True, secure=get_settings().cookies_secure, samesite="lax",
+        max_age=600, path=_oauth_cookie_path(),
+    )
+    response.set_cookie(_STATE_COOKIE, state, **common)
+    response.set_cookie(_VERIFIER_COOKIE, verifier, **common)
+    response.set_cookie(_INTENT_COOKIE, "link" if link else "login", **common)
+    if link:
+        claims = decode_access_token(request.cookies[ACCESS_COOKIE])
+        response.set_cookie(_LINK_SESSION_COOKIE, str(claims.family_id), **common)
+    return google.authorization_url(state, challenge)
+
+
+@router.get("/google/start")
+def google_start(request: Request) -> RedirectResponse:
+    response = RedirectResponse("/", status_code=302)
+    response.headers["location"] = _set_oauth_flow(response, request, link=False)
+    return response
+
+
+@router.post("/google/link")
+@limiter.limit(_settings.rate_limit_login, key_func=account_key)
+def google_link(
+    body: GoogleLinkBody, request: Request, response: Response,
+    user: User = Depends(current_user),
+) -> dict[str, str]:
+    verify_csrf(request)
+    if not verify_password_or_dummy(body.password, user.password_hash):
+        raise AppError(ErrorCode.E_AUTH_INVALID, log_detail="Google link password mismatch")
+    return {"url": _set_oauth_flow(response, request, link=True)}
 
 
 @router.get("/google/callback")
@@ -326,6 +373,7 @@ def google_callback(request: Request, db: Session = Depends(get_db)) -> Redirect
         response.delete_cookie(_STATE_COOKIE, path=cookie_path)
         response.delete_cookie(_VERIFIER_COOKIE, path=cookie_path)
         response.delete_cookie(_INTENT_COOKIE, path=cookie_path)
+        response.delete_cookie(_LINK_SESSION_COOKIE, path=cookie_path)
         return response
 
     def _err(reason: str = "1", log_detail: str | None = None) -> RedirectResponse:
@@ -336,7 +384,7 @@ def google_callback(request: Request, db: Session = Depends(get_db)) -> Redirect
     intent = request.cookies.get(_INTENT_COOKIE) or "login"
     code, state = request.query_params.get("code"), request.query_params.get("state")
     cookie_state, verifier = request.cookies.get(_STATE_COOKIE), request.cookies.get(_VERIFIER_COOKIE)
-    if not code or not state or not cookie_state or state != cookie_state or not verifier:
+    if not code or not state or not cookie_state or not secrets.compare_digest(state.encode(), cookie_state.encode()) or not verifier:
         return _err(log_detail="missing/mismatched oauth parameters")
     try:
         tokens = google.exchange_code(code, verifier)
@@ -345,11 +393,11 @@ def google_callback(request: Request, db: Session = Depends(get_db)) -> Redirect
     except AppError as exc:
         return _err(log_detail=f"{exc.code.value}: {exc.log_detail}")
     except Exception as exc:  # noqa: BLE001
-        return _err(log_detail=f"unexpected: {exc!r}")
+        return _err(log_detail=f"unexpected OAuth error ({type(exc).__name__})")
 
     provider_account_id = claims.get("sub")
     email = (claims.get("email") or "").lower().strip()
-    if not provider_account_id or not email or not bool(claims.get("email_verified")):
+    if not provider_account_id or not email or claims.get("email_verified") is not True:
         return _err(log_detail="google identity has no verified email")
     if profile.get("sub") != provider_account_id:
         return _err(log_detail="userinfo subject does not match id token")
@@ -364,36 +412,54 @@ def google_callback(request: Request, db: Session = Depends(get_db)) -> Redirect
         current = optional_user(request, db)
         if current is None:
             return _err()
+        claims = decode_access_token(request.cookies[ACCESS_COOKIE])
+        if request.cookies.get(_LINK_SESSION_COOKIE) != str(claims.family_id):
+            return _err()
+        db.refresh(current, with_for_update=True)
+        if optional_user(request, db) is None:
+            return _err()
         if existing_link is not None and existing_link.user_id != current.id:
             return _err("oauth_taken")
         if existing_link is None:
+            if db.scalar(select(OAuthAccount).where(
+                OAuthAccount.user_id == current.id, OAuthAccount.provider == "google"
+            )) is not None:
+                return _err("oauth_taken")
             db.add(OAuthAccount(user_id=current.id, provider="google", provider_account_id=provider_account_id))
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                return _err("oauth_taken")
         _apply_google_profile(current, display_name=display_name, picture=picture)
         db.commit()
         return _clear(RedirectResponse(f"{settings.frontend_url}/?linked=google", status_code=302))
 
     user = db.get(User, existing_link.user_id) if existing_link is not None else None
-    if user is None:
-        user = db.scalar(select(User).where(User.email == email))
-        if user is None:
-            user = User(email=email, email_verified=False)
-            db.add(user)
-            db.flush()
-        _apply_google_profile(user, display_name=display_name, picture=picture)
-        db.add(OAuthAccount(user_id=user.id, provider="google", provider_account_id=provider_account_id))
-        db.commit()
+    if user is not None:
+        db.refresh(user, with_for_update=True)
+        # A concurrent disconnect can invalidate a mapping we read before the lock.
+        if not user.email_verified or db.get(OAuthAccount, existing_link.id, populate_existing=True) is None:
+            return _err("oauth_link_required")
     else:
-        _apply_google_profile(user, display_name=display_name, picture=picture)
-
-    if not user.email_verified:
+        hosted_domain = claims.get("hd")
+        authoritative_email = email.endswith("@gmail.com") or (
+            isinstance(hosted_domain, str) and bool(hosted_domain)
+        )
+        if db.scalar(select(User.id).where(User.email == email)) is not None or not authoritative_email:
+            return _err("oauth_link_required")
+        user = User(email=email, email_verified=True)
+        db.add(user)
         try:
-            _send_activation_code(db, user, enforce_cooldown=False)
-        except Exception as exc:  # noqa: BLE001
-            return _err(log_detail=f"could not send activation code: {exc!r}")
-        return _clear(RedirectResponse(f"{settings.frontend_url}/?verify_email={quote(user.email)}", status_code=302))
+            db.flush()
+            db.add(OAuthAccount(user_id=user.id, provider="google", provider_account_id=provider_account_id))
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            return _err("oauth_link_required")
+    _apply_google_profile(user, display_name=display_name, picture=picture)
 
     user.last_login_at = datetime.now(timezone.utc)
-    db.commit()
     ua, ip = _client(request)
     access, refresh = start_session(db, user.id, ua=ua, ip=ip)
     redirect = _clear(RedirectResponse(f"{settings.frontend_url}/", status_code=302))
@@ -402,10 +468,14 @@ def google_callback(request: Request, db: Session = Depends(get_db)) -> Redirect
 
 
 @router.post("/google/unlink", response_model=UserView)
-def google_unlink(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)) -> UserView:
+def google_unlink(request: Request, response: Response, user: User = Depends(current_user), db: Session = Depends(get_db)) -> UserView:
     verify_csrf(request)
     if user.password_hash is None:
         raise AppError(ErrorCode.E_OAUTH_UNLINK_BLOCKED, log_detail="no password set on account")
-    db.execute(OAuthAccount.__table__.delete().where(OAuthAccount.user_id == user.id, OAuthAccount.provider == "google"))
-    db.commit()
+    db.refresh(user, with_for_update=True)
+    db.execute(delete(OAuthAccount).where(OAuthAccount.user_id == user.id, OAuthAccount.provider == "google"))
+    revoke_all_for_user(db, user.id)
+    ua, ip = _client(request)
+    access, refresh = start_session(db, user.id, ua=ua, ip=ip)
+    set_auth_cookies(response, access, refresh)
     return _view(user, db)

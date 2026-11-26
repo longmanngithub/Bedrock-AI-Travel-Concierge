@@ -17,6 +17,7 @@ from ..auth.cookies import verify_csrf
 from ..auth.deps import current_user
 from ..database import get_db
 from ..errors import AppError, ErrorCode
+from ..rate_limit import account_key, limiter
 from ..models import Conversation, Message, TripRecord, User
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -81,12 +82,11 @@ class ImportMessage(BaseModel):
 
 class ImportConversation(BaseModel):
     title: str = Field(default="", max_length=200)
-    messages: list[ImportMessage] = Field(default_factory=list, max_length=500)
+    messages: list[ImportMessage] = Field(default_factory=list, max_length=100)
 
 
 class ImportBody(BaseModel):
-    conversations: list[ImportConversation] = Field(default_factory=list, max_length=200)
-    client_id: str | None = Field(default=None, max_length=100)
+    conversations: list[ImportConversation] = Field(default_factory=list, max_length=20)
 
 
 def _conv_view(c: Conversation) -> ConversationView:
@@ -94,6 +94,13 @@ def _conv_view(c: Conversation) -> ConversationView:
         id=c.id, title=c.title,
         created_at=c.created_at.isoformat(), updated_at=c.updated_at.isoformat(),
     )
+
+
+def _reserve_conversations(db: Session, user: User, additional: int) -> None:
+    db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    count = db.scalar(select(func.count()).select_from(Conversation).where(Conversation.user_id == user.id))
+    if count + additional > 1000:
+        raise AppError(ErrorCode.E_VALIDATION, log_detail="account conversation limit reached")
 
 
 def _owned(conv_id: uuid.UUID, user: User, db: Session) -> Conversation:
@@ -121,11 +128,14 @@ def _quick_replies(message: Message) -> list[QuickReplyView]:
 
 # --- routes -----------------------------------------------------------------
 @router.get("", response_model=list[ConversationView])
-def list_conversations(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[ConversationView]:
+@limiter.limit("60/minute", key_func=account_key)
+def list_conversations(
+    request: Request, offset: int = Query(0, ge=0), user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> list[ConversationView]:
     rows = db.scalars(
         select(Conversation)
         .where(Conversation.user_id == user.id, Conversation.archived_at.is_(None))
-        .order_by(Conversation.updated_at.desc())
+        .order_by(Conversation.updated_at.desc(), Conversation.id.desc()).offset(offset).limit(100)
     ).all()
     return [_conv_view(c) for c in rows]
 
@@ -136,6 +146,7 @@ def create_conversation(
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ) -> ConversationView:
     verify_csrf(request)
+    _reserve_conversations(db, user, 1)
     conv = Conversation(user_id=user.id, title=(body.title.strip() or "New chat")[:200])
     db.add(conv)
     db.commit()
@@ -144,16 +155,17 @@ def create_conversation(
 
 
 @router.get("/{conv_id}/messages", response_model=list[MessageView])
+@limiter.limit("60/minute", key_func=account_key)
 def get_messages(
-    conv_id: uuid.UUID, before: int | None = Query(None),
+    conv_id: uuid.UUID, request: Request, before: int | None = Query(None),
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ) -> list[MessageView]:
     _owned(conv_id, user, db)
     stmt = select(Message).where(Message.conversation_id == conv_id)
     if before is not None:
         stmt = stmt.where(Message.seq < before)
-    stmt = stmt.order_by(Message.seq.asc())
-    rows = db.scalars(stmt).all()
+    stmt = stmt.order_by(Message.seq.desc()).limit(100)
+    rows = list(reversed(db.scalars(stmt).all()))
 
     record_ids = {m.trip_record_id for m in rows if m.trip_record_id is not None}
     records = {}
@@ -195,9 +207,13 @@ def append_message(
         candidate = db.get(TripRecord, body.trip_record_id)
         if candidate is not None and candidate.user_id == user.id:
             record = candidate
+    db.refresh(conv, with_for_update=True)
+    seq = _next_seq(db, conv_id)
+    if seq > 1000:
+        raise AppError(ErrorCode.E_VALIDATION, log_detail="conversation message limit reached")
     msg = Message(
         conversation_id=conv_id, role=body.role, content=body.content,
-        kind=body.kind, trip_record_id=record.id if record else None, seq=_next_seq(db, conv_id),
+        kind=body.kind, trip_record_id=record.id if record else None, seq=seq,
     )
     db.add(msg)
     conv.updated_at = datetime.now(timezone.utc)
@@ -270,13 +286,16 @@ def clear_all(request: Request, user: User = Depends(current_user), db: Session 
 
 
 @router.post("/import", response_model=list[ConversationView])
+@limiter.limit("4/hour", key_func=account_key)
 def import_conversations(
     body: ImportBody, request: Request,
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ) -> list[ConversationView]:
-    """One-shot migration of a browser's localStorage conversations. Also claims
-    any unowned trip_records created under the given client_id."""
+    """Import messages explicitly submitted by the signed-in account."""
     verify_csrf(request)
+    if sum(len(c.messages) for c in body.conversations) > 500:
+        raise AppError(ErrorCode.E_VALIDATION, log_detail="too many imported messages")
+    _reserve_conversations(db, user, len(body.conversations))
     created: list[Conversation] = []
     for ic in body.conversations:
         conv = Conversation(user_id=user.id, title=(ic.title or "")[:200])
@@ -287,12 +306,6 @@ def import_conversations(
                 conversation_id=conv.id, role=m.role, content=m.content, kind=m.kind, seq=i,
             ))
         created.append(conv)
-
-    # Best-effort claim of anonymous trips created by this browser.
-    if body.client_id:
-        db.query(TripRecord).filter(
-            TripRecord.client_id == body.client_id, TripRecord.user_id.is_(None)
-        ).update({TripRecord.user_id: user.id}, synchronize_session=False)
 
     db.commit()
     for c in created:

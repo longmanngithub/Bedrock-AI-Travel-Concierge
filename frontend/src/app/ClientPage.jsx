@@ -9,7 +9,7 @@ import { AuthProvider } from "../lib/AuthContext.jsx";
 import { ConversationsProvider, useConversations } from "../lib/ConversationsContext.jsx";
 import { jobs as jobsApi, subscribeJob } from "../lib/api.js";
 
-function ClientPageInner({ initialHasConversations, initialConversationCount, initialActiveStructure }) {
+function ClientPageInner() {
   const {
     conversations: convList,
     loadingList,
@@ -230,18 +230,27 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
   }
 
   async function handleDeleteConversation(id) {
-    abortStream(id);
-    await deleteConversation(id);
+    try {
+      await deleteConversation(id);
+      abortStream(id);
+    } catch {
+      window.alert("Could not delete the conversation. Try again.");
+    }
   }
 
   async function handleClearAll() {
+    try {
+      await clearAll();
+    } catch {
+      window.alert("Could not clear conversations. Try again.");
+      return;
+    }
     for (const controller of Object.values(streamControllersRef.current)) {
       controller.abort();
       controller.dispose?.();
     }
     streamControllersRef.current = {};
     setActiveStreams({});
-    await clearAll();
   }
 
   const sidebarProps = {
@@ -252,7 +261,6 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
     onDeleteConversation: handleDeleteConversation,
     onClearAll: handleClearAll,
     mounted: !loadingList,
-    initialConversationCount,
     activeStreams,
   };
 
@@ -316,8 +324,6 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
         </header>
 
         <ChatWindow
-          initialHasConversations={initialHasConversations}
-          initialActiveStructure={initialActiveStructure}
           streaming={activeStreams[activeId]?.streaming || null}
           streamError={activeStreams[activeId]?.error || null}
           submissionError={activeStreams[activeId]?.submissionError || null}
@@ -335,11 +341,11 @@ function ClientPageInner({ initialHasConversations, initialConversationCount, in
   );
 }
 
-export default function ClientPage(props) {
+export default function ClientPage() {
   return (
     <AuthProvider>
       <ConversationsProvider>
-        <ClientPageInner {...props} />
+        <ClientPageInner />
       </ConversationsProvider>
     </AuthProvider>
   );

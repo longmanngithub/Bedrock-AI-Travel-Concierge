@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -103,8 +103,8 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
         if job is None:
             logger.warning("job %s vanished before start", job_id)
             return
-        if job.status in _TERMINAL:
-            return  # a late or duplicate queue message must not reopen a terminal job
+        if job.status != JobStatus.queued:
+            return  # Only the first worker to claim a queued row starts the crew.
         job.status = JobStatus.running
         job.started_at = _utcnow()
         job.heartbeat_at = _utcnow()
@@ -117,18 +117,18 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
     try:
         trip_request = TripRequest(**payload["trip_request"])
     except Exception as exc:  # noqa: BLE001 - a bad payload is our bug, not the LLM's
-        await _finish_error(job_id, publisher, AppError(ErrorCode.E_INTERNAL, log_detail=str(exc)))
+        await _finish_error(job_id, publisher, AppError(ErrorCode.E_INTERNAL, log_detail=f"invalid job payload ({type(exc).__name__})"))
         return
 
-    memory_opt_in = False
+    memory_revision = None
     with SessionLocal() as db:
         job = db.get(Job, job_id)
         previous = _load_previous(job, payload.get("previous_record_id"))
         traveller_memory = None
         if job is not None and job.user_id is not None:
             user = db.get(User, job.user_id)
-            memory_opt_in = bool(user and user.memory_opt_in)
-            if memory_opt_in:
+            if user and user.memory_opt_in:
+                memory_revision = user.memory_revision
                 traveller_memory = build_traveller_memory(job.user_id, db)
 
     loop = asyncio.get_running_loop()
@@ -168,7 +168,7 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
 
     # Persist the record + mark job succeeded.
     delivery_id: str | None = None
-    telegram_user_id: str | None = None
+    telegram_recipient: tuple[str, int] | None = None
     with SessionLocal() as db:
         # Serialize with Stop so a late model response cannot overwrite it.
         job = db.get(Job, job_id, with_for_update=True)
@@ -212,7 +212,7 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
                     # flow is already a deliberate signal the traveller wants
                     # itineraries delivered there.
                     if user.telegram_chat_id is not None:
-                        telegram_user_id = str(user.id)
+                        telegram_recipient = (str(user.id), user.telegram_link_revision)
         db.commit()
 
         publisher.emit_terminal({
@@ -225,9 +225,11 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
 
         # Only after a genuinely successful build — a trip that errored out
         # taught us nothing real about the traveller (see memory.py).
-        if memory_opt_in and job.user_id is not None:
+        if memory_revision is not None and job.user_id is not None:
             try:
-                update_preferences_after_trip(job.user_id, trip_request, db)
+                owner = db.get(User, job.user_id, with_for_update=True, populate_existing=True)
+                if owner and owner.memory_opt_in and owner.memory_revision == memory_revision:
+                    update_preferences_after_trip(job.user_id, trip_request, db)
             except Exception:
                 logger.exception("Could not update traveller preferences for job %s", job_id)
 
@@ -237,8 +239,9 @@ async def run_itinerary_job(ctx: dict, job_id: str) -> None:
     deliveries = []
     if delivery_id:
         deliveries.append(send_response_email_job(ctx, delivery_id))
-    if telegram_user_id:
-        deliveries.append(deliver_itinerary_job(ctx, record_id, telegram_user_id, "telegram"))
+    if telegram_recipient:
+        user_id, revision = telegram_recipient
+        deliveries.append(deliver_itinerary_job(ctx, record_id, user_id, "telegram", revision))
     if deliveries:
         await asyncio.gather(*deliveries)
 
@@ -279,11 +282,37 @@ async def _finish_cancelled(job_id: str, publisher: RedisProgressPublisher) -> N
     publisher.emit_terminal({"kind": "cancelled", "status": "cancelled"})
 
 
+async def recover_queued_jobs(ctx: dict) -> None:
+    """Re-publish durable jobs whose original Redis dispatch may have failed."""
+    cutoff = _utcnow() - timedelta(seconds=60)
+    expired_before = _utcnow() - timedelta(minutes=30)
+    with SessionLocal() as db:
+        queued = db.scalars(
+            select(Job).where(Job.status == JobStatus.queued, Job.created_at < cutoff)
+            .order_by(Job.created_at, Job.id).limit(100).with_for_update(skip_locked=True)
+        ).all()
+        job_ids = []
+        for job in queued:
+            if job.created_at < expired_before:
+                job.status = JobStatus.expired
+                job.finished_at = _utcnow()
+                job.error_code = ErrorCode.E_JOB_EXPIRED.value
+                _reconcile_placeholder_message(
+                    db, str(job.id), kind="error",
+                    content=USER_MESSAGES[ErrorCode.E_JOB_EXPIRED], trip_record_id=None,
+                )
+            else:
+                job_ids.append(job.id)
+        db.commit()
+    for job_id in job_ids:
+        await ctx["redis"].enqueue_job(
+            "run_itinerary_job", str(job_id), _job_id=keys.arq_job_id(str(job_id)), _queue_name=keys.QUEUE_NAME,
+        )
+
+
 async def reap_stale_jobs(ctx: dict) -> None:
     """Cron: flip `running` jobs with a stale heartbeat to `expired` (worker
     OOM/crash), so a client SSE never hangs forever on a dead job."""
-    from datetime import timedelta
-
     cutoff = _utcnow() - timedelta(seconds=keys.HEARTBEAT_STALE_SECONDS)
     with SessionLocal() as db:
         stale = db.scalars(

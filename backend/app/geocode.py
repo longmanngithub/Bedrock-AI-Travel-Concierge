@@ -58,11 +58,11 @@ def reverse_geocode(lat: float, lon: float) -> str:
         )
         resp.raise_for_status()
         data = resp.json()
-    except httpx.HTTPError as exc:
-        raise AppError(ErrorCode.E_GEOCODE_FAILED, log_detail=f"geocode request failed: {exc}") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AppError(ErrorCode.E_GEOCODE_FAILED, log_detail=f"geocode request failed ({type(exc).__name__})") from None
 
     if data.get("status") != "OK":
-        raise AppError(ErrorCode.E_GEOCODE_FAILED, log_detail=f"geocode status: {data.get('status')}")
+        raise AppError(ErrorCode.E_GEOCODE_FAILED, log_detail="geocode provider rejected the request")
 
     results = data.get("results") or []
     if not results:

@@ -7,26 +7,35 @@ Three clients, three jobs:
 """
 from __future__ import annotations
 
-from functools import lru_cache
+import json
 
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
 from ..config import get_settings
+from .keys import QUEUE_NAME
 
 
 def redis_settings() -> RedisSettings:
-    return RedisSettings.from_dsn(get_settings().redis_url)
+    settings = get_settings()
+    return RedisSettings.from_dsn(settings.queue_redis_url or settings.redis_url)
 
 
 _arq_pool: ArqRedis | None = None
+
+
+def serialize_job(value: dict) -> bytes:
+    return json.dumps(value, separators=(",", ":")).encode()
 
 
 async def get_arq_pool() -> ArqRedis:
     """Process-wide arq pool, created lazily (in the FastAPI lifespan)."""
     global _arq_pool
     if _arq_pool is None:
-        _arq_pool = await create_pool(redis_settings())
+        _arq_pool = await create_pool(
+            redis_settings(), job_serializer=serialize_job, job_deserializer=json.loads,
+            default_queue_name=QUEUE_NAME,
+        )
     return _arq_pool
 
 
