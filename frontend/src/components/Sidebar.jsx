@@ -113,7 +113,6 @@ export default function Sidebar({
   onClearAll,
   onClose,
   mounted,
-  initialConversationCount,
   activeStreams,
 }) {
   const [confirmClear, setConfirmClear] = useState(false);
@@ -151,7 +150,6 @@ export default function Sidebar({
     onClose?.();
   }
 
-  const initialCount = initialConversationCount ?? 3;
 
   return (
     // `overflow-hidden` clips every child to the panel's rounded corners. The
@@ -196,7 +194,7 @@ export default function Sidebar({
             // Destructive action gets the same inline confirm as single-chat
             // delete — previously Clear All fired immediately with no guard.
             <span className="flex items-center gap-2 text-xs">
-              <span className="text-muted">Clear all?</span>
+              <span className="text-muted">Clear all chats?</span>
               <button
                 type="button"
                 onClick={() => { setConfirmClear(false); onClearAll(); }}
@@ -230,7 +228,7 @@ export default function Sidebar({
         style={{ paddingBottom: footerHeight + 8 }}
       >
         {!mounted ? (
-          <SidebarSkeleton count={initialCount} />
+          <SidebarSkeleton />
         ) : conversations.length === 0 ? (
           <p className="px-5 py-6 text-center text-xs text-muted">Your trip conversations will show up here.</p>
         ) : (

@@ -45,7 +45,7 @@ def get_bot_username() -> str | None:
         resp.raise_for_status()
         return resp.json()["result"]["username"]
     except Exception:  # noqa: BLE001 - a missing username just disables the deep link
-        logger.warning("telegram getMe failed", exc_info=True)
+        logger.warning("telegram getMe failed")
         return None
 
 
@@ -58,7 +58,7 @@ def send_message(chat_id: int, text: str) -> None:
         )
         resp.raise_for_status()
     except httpx.HTTPError:
-        logger.warning("telegram sendMessage failed for chat %s", chat_id, exc_info=True)
+        logger.warning("telegram sendMessage failed")
 
 
 def send_document(*, chat_id: int, pdf_bytes: bytes, filename: str, caption: str) -> None:
@@ -75,21 +75,21 @@ def send_document(*, chat_id: int, pdf_bytes: bytes, filename: str, caption: str
         resp.raise_for_status()
         body = resp.json()
         if not body.get("ok"):
-            raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"telegram sendDocument: {body}")
+            raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail="telegram rejected the document")
     except httpx.HTTPStatusError as exc:
         raise AppError(
             ErrorCode.E_DELIVERY_FAILED,
-            log_detail=f"telegram {exc.response.status_code}: {exc.response.text[:300]}",
-        ) from exc
+            log_detail=f"telegram HTTP {exc.response.status_code}",
+        ) from None
     except httpx.HTTPError as exc:
-        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"telegram request failed: {exc}") from exc
+        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"telegram request failed ({type(exc).__name__})") from None
 
 
 def get_updates(offset: int | None, timeout: int = 0) -> list[dict]:
     """Long-poll wrapper for the linking cron. `timeout=0` = return immediately
     (used here since the cron itself provides the polling cadence — a
     blocking long-poll would tie up the worker's async loop)."""
-    params: dict = {"timeout": timeout}
+    params: dict = {"timeout": timeout, "limit": 20, "allowed_updates": '["message"]'}
     if offset is not None:
         params["offset"] = offset
     try:
@@ -98,5 +98,5 @@ def get_updates(offset: int | None, timeout: int = 0) -> list[dict]:
         body = resp.json()
         return body.get("result", []) if body.get("ok") else []
     except httpx.HTTPError:
-        logger.warning("telegram getUpdates failed", exc_info=True)
+        logger.warning("telegram getUpdates failed")
         return []

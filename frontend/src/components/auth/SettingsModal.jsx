@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { assetUrl, auth, formatError, settings } from "../../lib/api.js";
 import { useAuth } from "../../lib/AuthContext.jsx";
+import { LEGACY_LOCAL_KEY, useConversations } from "../../lib/ConversationsContext.jsx";
 
 function Toggle({ checked, onChange, disabled, label }) {
   return (
@@ -115,7 +116,38 @@ function TelegramSection() {
   return <Section title="Telegram delivery"><div className="flex items-start justify-between gap-4"><p className="text-xs leading-relaxed text-muted">Bedrock sends the boarding-pass PDF here automatically whenever a plan finishes.</p>{user?.telegram_linked ? <button type="button" onClick={disconnect} disabled={busy} className="rounded-full border border-line px-2.5 py-1 text-xs font-medium text-ink-soft">Disconnect</button> : <button type="button" onClick={connect} disabled={busy} className="rounded-full bg-brand px-2.5 py-1 text-xs font-medium text-on-brand">Connect</button>}</div>{link && <div className="rounded-xl border border-line bg-canvas p-3 text-xs text-muted">{link.deep_link ? <a href={link.deep_link} target="_blank" rel="noopener noreferrer" className="block rounded-lg bg-brand px-3 py-2 text-center font-medium text-on-brand">Open Telegram to connect</a> : <>Send <code>/start {link.code}</code> to the Bedrock bot.</>}<p className="mt-2 text-center">Waiting for confirmation…</p></div>}{error && <p className="text-xs text-danger">{error}</p>}</Section>;
 }
 
+function LocalHistorySection() {
+  const { migrateLocalHistory } = useConversations();
+  const [available, setAvailable] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    try { setAvailable(Boolean(window.localStorage.getItem(LEGACY_LOCAL_KEY))); } catch { return; }
+  }, []);
+
+  if (!available) return null;
+  async function importHistory() {
+    setBusy(true);
+    setError("");
+    try {
+      if (await migrateLocalHistory()) setAvailable(false);
+    } catch (err) {
+      setError(formatError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <Section title="Old chats on this device">
+    <button type="button" disabled={busy} onClick={importHistory}
+      className="rounded-full border border-line px-3 py-1.5 text-xs font-medium text-ink-soft">
+      Import into this account
+    </button>
+    {error && <p role="alert" className="text-xs text-danger">{error}</p>}
+  </Section>;
+}
+
 export default function SettingsModal({ onClose }) {
   if (typeof document === "undefined") return null;
-  return createPortal(<div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={onClose}><div className="thin-scroll max-h-[90dvh] w-full max-w-sm space-y-5 overflow-y-auto rounded-2xl border border-line bg-surface p-6 shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><h2 className="text-lg font-semibold text-ink">Settings</h2><button type="button" onClick={onClose} aria-label="Close" className="text-muted hover:text-ink">✕</button></div><MemorySection /><div className="border-t border-line" /><CompletionEmailSection /><div className="border-t border-line" /><LocationSharingSection /><ProfileSection /><PasswordSection /><div className="border-t border-line" /><TelegramSection /></div></div>, document.body);
+  return createPortal(<div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={onClose}><div className="thin-scroll max-h-[90dvh] w-full max-w-sm space-y-5 overflow-y-auto rounded-2xl border border-line bg-surface p-6 shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><h2 className="text-lg font-semibold text-ink">Settings</h2><button type="button" onClick={onClose} aria-label="Close" className="text-muted hover:text-ink">✕</button></div><MemorySection /><div className="border-t border-line" /><CompletionEmailSection /><div className="border-t border-line" /><LocationSharingSection /><ProfileSection /><PasswordSection /><div className="border-t border-line" /><TelegramSection /><LocalHistorySection /></div></div>, document.body);
 }

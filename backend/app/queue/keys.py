@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 EVENTS_MAXLEN = 500
-STATE_TTL = 86_400          # 24h
+STATE_TTL = 3_600           # Job results are durably stored in PostgreSQL.
+QUEUE_NAME = "bedrock:arq:json"
 CANCEL_TTL = 3_600          # 1h
 FRAME_VERSION = 1
 # A `running` job whose heartbeat is older than this is reaped as `expired`.
@@ -31,4 +32,4 @@ def cancel_key(job_id: str) -> str:
 
 def arq_job_id(job_id: str) -> str:
     """arq dedupe id — makes a re-enqueue of the same job a no-op."""
-    return f"crew:{job_id}"
+    return f"crew:json:{job_id}"

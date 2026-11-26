@@ -84,14 +84,12 @@ def send_itinerary_email(
         data = resp.json() if resp.content else {}
         return data.get("id") if isinstance(data, dict) else None
     except httpx.HTTPStatusError as exc:
-        # Resend's error body is a safe (non-secret) JSON reason — worth a
-        # couple hundred chars in the log, never in the response to the client.
         raise AppError(
             ErrorCode.E_DELIVERY_FAILED,
-            log_detail=f"resend {exc.response.status_code}: {exc.response.text[:300]}",
-        ) from exc
+            log_detail=f"resend HTTP {exc.response.status_code}",
+        ) from None
     except httpx.HTTPError as exc:
-        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"resend request failed: {exc}") from exc
+        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"resend request failed ({type(exc).__name__})") from None
 
 
 def send_verification_email(*, to_email: str, code: str) -> None:
@@ -119,7 +117,7 @@ def send_verification_email(*, to_email: str, code: str) -> None:
         )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
-        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"verification email failed: {exc}") from exc
+        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"verification email failed ({type(exc).__name__})") from None
 
 
 def send_response_email(*, to_email: str, content: str, idempotency_key: str) -> str | None:
@@ -154,4 +152,4 @@ def send_response_email(*, to_email: str, content: str, idempotency_key: str) ->
         data = resp.json() if resp.content else {}
         return data.get("id") if isinstance(data, dict) else None
     except httpx.HTTPError as exc:
-        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"completion email failed: {exc}") from exc
+        raise AppError(ErrorCode.E_DELIVERY_FAILED, log_detail=f"completion email failed ({type(exc).__name__})") from None

@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     # --- Redis / job queue (arq) ---
     # Live progress + queue backend. Postgres remains the source of truth for
     # job rows and results; Redis holds only ephemeral progress streams.
+    queue_redis_url: str | None = None
     redis_url: str = "redis://localhost:6379/0"
     # In-process job concurrency for the worker. On a 4 GB box this is 2 —
     # two kickoffs share one torch/Chroma load. See docker-compose worker.
@@ -132,6 +133,7 @@ class Settings(BaseSettings):
     # Set True behind TLS (production). Controls the Secure cookie flag; keep
     # False for plain-http localhost or the browser drops the cookie.
     cookies_secure: bool = False
+    production: bool = False
     # Frontend origin the OAuth callback redirects back to.
     frontend_url: str = "http://localhost:5173"
 
@@ -186,6 +188,17 @@ class Settings(BaseSettings):
     # --- RAG ---
     chroma_dir: str = str(BACKEND_DIR / "app" / "rag" / "chroma_store")
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_revision: str | None = None
+
+    @property
+    def embedding_model_kwargs(self) -> dict[str, str]:
+        kwargs = {"device": "cpu"}
+        revision = self.embedding_revision
+        if revision is None and self.embedding_model == "sentence-transformers/all-MiniLM-L6-v2":
+            revision = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+        if revision:
+            kwargs["revision"] = revision
+        return kwargs
 
     # --- Rate limiting ---
     # Free Gemini Flash-Lite allows ~15 requests/min. A crew run bursts many
@@ -211,11 +224,7 @@ class Settings(BaseSettings):
     # window clears before the next burst. Raise this if you still see 429s.
     eval_request_delay: float = 12.0
 
-    # --- API security (off by default; local coursework demo) ---
-    # If set, every route except /health requires a matching `X-API-Key`
-    # header. Left unset for local development so the demo keeps working with
-    # zero configuration; set this before exposing the API beyond localhost.
-    api_key: str | None = None
+    # --- API security ---
     # Comma-separated list of origins allowed to call the API from a browser.
     # Defaults to the Next.js dev server port (see frontend/package.json).
     # Deliberately NOT "*" — a wildcard would let any website's JS call this

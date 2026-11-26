@@ -305,7 +305,7 @@ def _get_retriever():
                 # and it makes local Apple Silicon dev builds behave the same
                 # as the CPU-only Linux Docker image (no MPS there either).
                 embeddings = HuggingFaceEmbeddings(
-                    model_name=settings.embedding_model, model_kwargs={"device": "cpu"}
+                    model_name=settings.embedding_model, model_kwargs=settings.embedding_model_kwargs
                 )
                 store = Chroma(
                     collection_name="travel_kb",

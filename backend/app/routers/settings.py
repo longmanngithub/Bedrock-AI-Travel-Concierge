@@ -4,9 +4,10 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import Response
 from sqlalchemy import delete
@@ -21,6 +22,7 @@ from ..errors import AppError, ErrorCode
 from ..models import User, UserPreference
 from ..queue import keys
 from ..queue.settings import sync_redis
+from ..rate_limit import account_key, limiter
 from .auth import UserView, _view
 
 router = APIRouter(prefix="/me", tags=["settings"])
@@ -51,7 +53,10 @@ def _now() -> datetime:
 @router.patch("/memory", response_model=UserView)
 def set_memory_opt_in(body: MemoryOptInBody, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)) -> UserView:
     verify_csrf(request)
-    user.memory_opt_in = body.opt_in
+    db.refresh(user, with_for_update=True)
+    if user.memory_opt_in != body.opt_in:
+        user.memory_revision += 1
+        user.memory_opt_in = body.opt_in
     db.commit()
     db.refresh(user)
     return _view(user, db)
@@ -78,22 +83,28 @@ def set_location_sharing_opt_in(body: LocationSharingBody, request: Request, use
 @router.delete("/memory", response_model=UserView)
 def delete_memory(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)) -> UserView:
     verify_csrf(request)
+    db.refresh(user, with_for_update=True)
+    user.memory_revision += 1
     db.execute(delete(UserPreference).where(UserPreference.user_id == user.id))
     db.commit()
     return _view(user, db)
 
 
 @router.post("/avatar", response_model=UserView)
+@limiter.limit("10/hour", key_func=account_key)
 async def upload_avatar(
     request: Request,
-    file: UploadFile = File(...),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> UserView:
     verify_csrf(request)
     if user.password_hash is None:
         raise AppError(ErrorCode.E_FORBIDDEN, log_detail="avatar upload for oauth-only user")
-    raw = await file.read(MAX_AVATAR_BYTES + 1)
+    async with request.form(max_files=1, max_fields=0) as form:
+        file = form.get("file")
+        if not isinstance(file, UploadFile):
+            raise AppError(ErrorCode.E_VALIDATION, log_detail="file upload required")
+        raw = await file.read(MAX_AVATAR_BYTES + 1)
     # Pillow decode/re-encode is CPU-bound; this route is async so FastAPI
     # won't thread-offload it automatically the way it does for a `def`
     # route — do it explicitly or it blocks the single event loop this
@@ -136,12 +147,13 @@ def delete_avatar(request: Request, user: User = Depends(current_user), db: Sess
 
 
 @router.post("/telegram/link-code", response_model=TelegramLinkView)
+@limiter.limit("6/hour", key_func=account_key)
 def create_telegram_link_code(request: Request, user: User = Depends(current_user)) -> TelegramLinkView:
     verify_csrf(request)
     code = secrets.token_urlsafe(9)
     r = sync_redis()
     try:
-        r.set(keys.telegram_link_key(code), str(user.id), ex=keys.TELEGRAM_LINK_TTL)
+        r.set(keys.telegram_link_key(code), f"{user.id}:{user.telegram_link_revision}", ex=keys.TELEGRAM_LINK_TTL)
     finally:
         r.close()
     username = get_bot_username() if telegram_configured() else None
@@ -152,6 +164,8 @@ def create_telegram_link_code(request: Request, user: User = Depends(current_use
 @router.post("/telegram/unlink", response_model=UserView)
 def unlink_telegram(request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)) -> UserView:
     verify_csrf(request)
+    db.refresh(user, with_for_update=True)
+    user.telegram_link_revision += 1
     user.telegram_chat_id = None
     db.commit()
     db.refresh(user)

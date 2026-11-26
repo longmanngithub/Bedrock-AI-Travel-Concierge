@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
+from anyio import move_on_after
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from redis.exceptions import RedisError
@@ -22,10 +24,10 @@ from starlette.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..auth.cookies import verify_csrf
-from ..auth.deps import current_user
+from ..auth.cookies import ACCESS_COOKIE, verify_csrf
+from ..auth.deps import current_user, session_token_is_active
 from ..database import get_db
-from ..errors import AppError, ErrorCode, USER_MESSAGES
+from ..errors import AppError, ErrorCode, USER_MESSAGES, error_payload
 from ..models import Job, JobStatus, Message, TripRecord, User
 from ..queue import keys
 from ..queue.settings import async_redis
@@ -35,6 +37,15 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL = {JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled, JobStatus.expired}
 _TERMINAL_EVENTS = {"done", "error", "cancelled"}
+_STREAM_SECONDS = 540
+_STREAMS_PER_ACCOUNT = 4
+_PROCESS_STREAMS = asyncio.Semaphore(32)
+_RELEASE_STREAM_SLOT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 class JobView(BaseModel):
@@ -141,14 +152,34 @@ async def job_events(
     state_key = keys.state_key(str(job_id))
     terminal_now = _terminal_frame(db, job)
     last_event_id = request.headers.get("Last-Event-ID")
+    token = request.cookies.get(ACCESS_COOKIE)
+    user_id = user.id
+    db.close()  # Blocking stream reads must never pin a database connection.
 
     async def gen():
         if terminal_now is not None:
             yield f"data: {json.dumps(terminal_now)}\n\n"
             return
 
+        if _PROCESS_STREAMS.locked():
+            frame = {"kind": "error", **error_payload(AppError(ErrorCode.E_RATE_LIMITED))}
+            yield f"data: {json.dumps(frame)}\n\n"
+            return
+        await _PROCESS_STREAMS.acquire()
         r = async_redis()
+        slot_key = None
+        lease = uuid.uuid4().hex
+        deadline = time.monotonic() + _STREAM_SECONDS
         try:
+            for slot in range(_STREAMS_PER_ACCOUNT):
+                candidate = f"bedrock:stream:{user_id}:{slot}"
+                if await r.set(candidate, lease, nx=True, ex=_STREAM_SECONDS + 10):
+                    slot_key = candidate
+                    break
+            if slot_key is None:
+                frame = {"kind": "error", **error_payload(AppError(ErrorCode.E_RATE_LIMITED))}
+                yield f"data: {json.dumps(frame)}\n\n"
+                return
             # Capture the cursor before the snapshot so an update published
             # between them is still eligible for stream replay.
             if not last_event_id:
@@ -166,10 +197,12 @@ async def job_events(
                 cursor = last_event_id
 
             idle = 0
-            while True:
+            while time.monotonic() < deadline:
                 if await request.is_disconnected():
                     return
                 resp = await r.xread({stream: cursor}, block=5000, count=20)
+                if token and not await run_in_threadpool(session_token_is_active, token):
+                    return
                 if not resp:
                     idle += 1
                     yield ": keep-alive\n\n"
@@ -195,7 +228,16 @@ async def job_events(
                         if _is_terminal_event(payload):
                             return
         finally:
-            await r.aclose()
+            _PROCESS_STREAMS.release()
+            try:
+                with move_on_after(2, shield=True):
+                    if slot_key is not None:
+                        await r.eval(_RELEASE_STREAM_SLOT, 1, slot_key, lease)
+            except RedisError:
+                logger.warning("Could not release an itinerary stream slot")
+            finally:
+                with move_on_after(2, shield=True):
+                    await r.aclose()
 
     return StreamingResponse(
         gen(),

@@ -7,7 +7,7 @@
 // dialog covers it instead — nothing behind either overlay is reachable.
 // There is no anonymous mode; every screen requires an account.
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { auth, geo, setAuthLostHandler, setLocationHint } from "./api.js";
+import { auth, geo, setActiveAccount, setAuthLostHandler, setLocationHint } from "./api.js";
 import AuthDialog from "../components/auth/AuthDialog.jsx";
 import Logo from "../components/Logo.jsx";
 
@@ -26,19 +26,30 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState(null); // { type: "success" | "error", message }
   const [pendingVerificationEmail, setPendingVerificationEmail] = useState(null);
+  const accountRef = useRef(null);
+  const identityVersion = useRef(0);
+  const setSessionUser = useCallback((next) => {
+    const account = next?.id ?? null;
+    if (account !== accountRef.current) identityVersion.current += 1;
+    accountRef.current = account;
+    setActiveAccount(account);
+    setUser(next);
+  }, []);
 
   const refresh = useCallback(async () => {
+    const version = identityVersion.current;
     try {
       const me = await auth.me();
-      setUser(me);
+      if (version !== identityVersion.current) return null;
+      setSessionUser(me);
       return me;
     } catch {
-      setUser(null);
+      if (version === identityVersion.current) setSessionUser(null);
       return null;
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setSessionUser]);
 
   useEffect(() => {
     refresh();
@@ -63,6 +74,8 @@ export function AuthProvider({ children }) {
       refresh();
     } else if (authError === "oauth_taken") {
       setNotice({ type: "error", message: "That Google account is already linked to a different account." });
+    } else if (authError === "oauth_link_required") {
+      setNotice({ type: "error", message: "Sign in with email or create an account, then connect Google in Settings." });
     } else if (authError) {
       setNotice({ type: "error", message: "We couldn't complete sign-in with Google. Please try again." });
     }
@@ -76,16 +89,16 @@ export function AuthProvider({ children }) {
 
   const dismissNotice = useCallback(() => setNotice(null), []);
   const updateUser = useCallback((nextUser) => {
-    if (nextUser) setUser(nextUser);
+    if (nextUser?.id === accountRef.current) setSessionUser(nextUser);
     return nextUser;
-  }, []);
+  }, [setSessionUser]);
 
   // Drop the session client-side so the gate re-covers the app immediately —
   // used both for an explicit logout and for a mid-session 401 that a silent
   // refresh couldn't recover (the refresh token itself expired or was
   // revoked), since in both cases the correct next step is the same: sign in
   // again before anything else is usable.
-  const forceReauth = useCallback(() => setUser(null), []);
+  const forceReauth = useCallback(() => setSessionUser(null), [setSessionUser]);
 
   // api.js can't import this context (it would be circular — this file
   // already imports api.js), so it exposes a setter instead: any request
@@ -120,31 +133,37 @@ export function AuthProvider({ children }) {
   // permission grant makes every later call silent. Any failure (permission
   // denied, no geolocation support, geocoding down) just leaves the hint
   // unset; it must never block or interrupt chat.
-  const locationCapturedRef = useRef(false);
   useEffect(() => {
-    if (!user?.location_share_opt_in) {
-      locationCapturedRef.current = false;
-      setLocationHint(null);
-      return;
-    }
-    if (locationCapturedRef.current) return;
-    if (typeof navigator === "undefined" || !navigator.geolocation) return;
-    locationCapturedRef.current = true;
+    setLocationHint(null);
+    if (!user?.id || !user.location_share_opt_in || !navigator.geolocation) return;
+    const controller = new AbortController();
     navigator.geolocation.getCurrentPosition(
       (pos) => {
+        if (controller.signal.aborted) return;
         geo
-          .reverseGeocode(pos.coords.latitude, pos.coords.longitude)
-          .then((result) => setLocationHint(result?.origin))
+          .reverseGeocode(pos.coords.latitude, pos.coords.longitude, controller.signal, user.id)
+          .then((result) => {
+            if (!controller.signal.aborted) setLocationHint(result?.origin, user.id);
+          })
           .catch(() => {});
       },
       () => {},
       { enableHighAccuracy: false, timeout: 10000, maximumAge: 3600000 }
     );
-  }, [user?.location_share_opt_in]);
+    return () => {
+      controller.abort();
+      setLocationHint(null);
+    };
+  }, [user?.id, user?.location_share_opt_in]);
 
   async function logout() {
-    await auth.logout().catch(() => {});
-    setUser(null);
+    const version = identityVersion.current;
+    try {
+      await auth.logout();
+      if (version === identityVersion.current) setSessionUser(null);
+    } catch {
+      setNotice({ type: "error", message: "Sign-out failed. Please try again." });
+    }
   }
 
   const value = { user, loading, refresh, updateUser, logout, forceReauth, notice, dismissNotice };
@@ -158,10 +177,13 @@ export function AuthProvider({ children }) {
         <AuthDialog
           dismissible={false}
           initialVerificationEmail={pendingVerificationEmail}
+          authNotice={notice}
+          key={pendingVerificationEmail || "sign-in"}
           onVerificationRequired={(email) => setPendingVerificationEmail(email)}
           onAuthed={(u) => {
             setPendingVerificationEmail(null);
-            setUser(u);
+            setNotice(null);
+            setSessionUser(u);
           }}
         />
       )}

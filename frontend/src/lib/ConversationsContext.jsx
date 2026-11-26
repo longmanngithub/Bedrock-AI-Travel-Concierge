@@ -16,7 +16,7 @@ const ConversationsCtx = createContext(null);
 
 const ACTIVE_ID_KEY = "bedrock:active_id";
 const SESSION_ACTIVE_KEY = "bedrock:session_active";
-const LEGACY_LOCAL_KEY = "bedrock:conversations";
+export const LEGACY_LOCAL_KEY = "bedrock:conversations";
 const TITLE_MAX_LEN = 40;
 
 function deriveTitle(firstUserMessage) {
@@ -46,12 +46,23 @@ function toClientMessage(m) {
 
 export function ConversationsProvider({ children }) {
   const { user } = useAuth();
+  return <AccountConversations key={user?.id ?? "signed-out"} user={user}>{children}</AccountConversations>;
+}
+
+function AccountConversations({ children, user }) {
   const [list, setList] = useState([]);
   const [loadingList, setLoadingList] = useState(true);
   const [activeId, setActiveIdState] = useState(null);
   const [messagesByConv, setMessagesByConv] = useState({});
   const [loadingMessagesFor, setLoadingMessagesFor] = useState(null);
-  const migratedRef = useRef(false);
+  const mounted = useRef(false);
+  const requests = useRef(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    requests.current = controller;
+    mounted.current = true;
+    return () => { mounted.current = false; controller.abort(); };
+  }, []);
 
   // `silent: true` re-fetches without flipping the loading flag. The flag
   // drives skeleton placeholders, which are right for a first load (there is
@@ -64,8 +75,8 @@ export function ConversationsProvider({ children }) {
   const refreshList = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoadingList(true);
     try {
-      const rows = await api.list();
-      setList(rows);
+      const rows = await api.list({ signal: requests.current?.signal });
+      if (mounted.current) setList(rows);
       return rows;
     } catch {
       if (!silent) setList([]);
@@ -75,13 +86,10 @@ export function ConversationsProvider({ children }) {
     }
   }, []);
 
-  // One-shot: fold any pre-account localStorage conversations into the new
-  // account, then delete the local copy so this never runs again for real.
-  // Safe to call every time a user becomes available — a no-op once the
-  // legacy key is gone.
+  // Import runs only from an explicit action in Settings.
+  // The source remains on this device if the request fails.
   const migrateLocalHistory = useCallback(async () => {
-    if (typeof window === "undefined" || migratedRef.current) return;
-    migratedRef.current = true;
+    if (!window.confirm("Import this device’s old chats into your signed-in account? Continue only if the chats are yours.")) return;
     let raw;
     try {
       raw = window.localStorage.getItem(LEGACY_LOCAL_KEY);
@@ -89,35 +97,25 @@ export function ConversationsProvider({ children }) {
       return;
     }
     if (!raw) return;
-    try {
-      const parsed = JSON.parse(raw);
-      const convs = Array.isArray(parsed.conversations) ? parsed.conversations : [];
-      const payload = convs
-        .filter((c) => c.messages?.length)
-        .map((c) => ({
-          title: c.title || "",
-          messages: c.messages.map((m) => ({
-            role: m.role,
-            content: m.content || "",
-            kind: m.kind || "text",
-          })),
-        }));
-      if (payload.length) {
-        let clientId = null;
-        try {
-          clientId = window.localStorage.getItem("bedrock:client_id");
-        } catch {
-          /* ignore */
-        }
-        await api.import({ conversations: payload, client_id: clientId });
-      }
-      window.localStorage.removeItem(LEGACY_LOCAL_KEY);
-    } catch {
-      // Best-effort — leave the local copy in place if the import failed, so
-      // it can be retried on a future load rather than silently losing it.
-      migratedRef.current = false;
+    const parsed = JSON.parse(raw);
+    const convs = Array.isArray(parsed.conversations) ? parsed.conversations : [];
+    const payload = convs
+      .filter((c) => c.messages?.length)
+      .map((c) => ({
+        title: c.title || "",
+        messages: c.messages.map((m) => ({
+          role: m.role,
+          content: m.content || "",
+          kind: m.kind || "text",
+        })),
+      }));
+    if (payload.length) {
+      await api.import({ conversations: payload }, user.id, requests.current?.signal);
+      await refreshList();
     }
-  }, []);
+    window.localStorage.removeItem(LEGACY_LOCAL_KEY);
+    return true;
+  }, [refreshList, user?.id]);
 
   const setActiveId = useCallback((id) => {
     setActiveIdState(id);
@@ -133,7 +131,7 @@ export function ConversationsProvider({ children }) {
     if (!convId) return [];
     if (!silent) setLoadingMessagesFor(convId);
     try {
-      const rows = await api.messages(convId);
+      const rows = await api.messages(convId, { signal: requests.current?.signal });
       const msgs = rows.map(toClientMessage);
       setMessagesByConv((prev) => ({ ...prev, [convId]: msgs }));
       return msgs;
@@ -162,8 +160,9 @@ export function ConversationsProvider({ children }) {
       return;
     }
     (async () => {
-      await migrateLocalHistory();
+      const signal = requests.current?.signal;
       const rows = await refreshList();
+      if (signal?.aborted) return;
 
       // Same new-tab-vs-reload rule the old local store used: a brand-new
       // browser tab always starts on the Welcome screen; reloading the same
@@ -269,7 +268,7 @@ export function ConversationsProvider({ children }) {
 
   const deleteConversation = useCallback(
     async (convId) => {
-      await api.remove(convId).catch(() => {});
+      await api.remove(convId);
       setList((prev) => prev.filter((c) => c.id !== convId));
       setMessagesByConv((prev) => {
         const next = { ...prev };
@@ -284,7 +283,7 @@ export function ConversationsProvider({ children }) {
   );
 
   const clearAll = useCallback(async () => {
-    await api.clearAll().catch(() => {});
+    await api.clearAll();
     setList([]);
     setMessagesByConv({});
     setActiveId(null);
@@ -300,6 +299,7 @@ export function ConversationsProvider({ children }) {
     ensureActiveConversation,
     startNewChat,
     refreshList,
+    migrateLocalHistory,
     loadMessages,
     appendMessage,
     updateMessageLocal,

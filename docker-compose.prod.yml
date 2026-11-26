@@ -18,33 +18,21 @@ x-backend-env: &backend-env
   DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}}
 
   REDIS_URL: ${REDIS_URL:-redis://${REDIS_USER:-default}:${REDIS_PASSWORD}@${REDIS_HOST:-localhost}:${REDIS_PORT:-6379}/${REDIS_DB_INDEX:-0}}
+  QUEUE_REDIS_URL: ${QUEUE_REDIS_URL:-}
 
   # Auth & Security
-  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (a long random string)}
   COOKIES_SECURE: ${COOKIES_SECURE:-true}
   FRONTEND_URL: ${FRONTEND_URL:?set FRONTEND_URL in .env}
-  GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
-  GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
-  GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
   ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
   RATE_LIMIT_GENERATE: ${RATE_LIMIT_GENERATE:-20/minute}
 
   # Notifications & Communications
   RESEND_API_KEY: ${RESEND_API_KEY:-}
   EMAIL_FROM: "${EMAIL_FROM:-AI Travel Concierge <onboarding@resend.dev>}"
-  EMAIL_VERIFICATION_SECRET: ${EMAIL_VERIFICATION_SECRET:-}
   OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-600}
   OTP_RESEND_COOLDOWN_SECONDS: ${OTP_RESEND_COOLDOWN_SECONDS:-60}
   OTP_MAX_ATTEMPTS: ${OTP_MAX_ATTEMPTS:-5}
   TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-
-  # File Storage
-  AVATAR_STORAGE_BACKEND: ${AVATAR_STORAGE_BACKEND:-local}
-  AVATAR_LOCAL_DIR: /var/lib/bedrock/avatars
-  R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
-  R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
-  R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
-  R2_BUCKET: ${R2_BUCKET:-}
 
   # External APIs
   TAVILY_API_KEY: ${TAVILY_API_KEY:-}
@@ -60,10 +48,22 @@ services:
     restart: unless-stopped
     environment:
       <<: *backend-env
+      PRODUCTION: "true"
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (a long random string)}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
+      EMAIL_VERIFICATION_SECRET: ${EMAIL_VERIFICATION_SECRET:-}
+      AVATAR_STORAGE_BACKEND: ${AVATAR_STORAGE_BACKEND:-local}
+      AVATAR_LOCAL_DIR: /var/lib/bedrock/avatars
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET: ${R2_BUCKET:-}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
-      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     volumes:
       - concierge_avatars:/var/lib/bedrock/avatars
     expose:
@@ -78,7 +78,7 @@ services:
     restart: unless-stopped
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
     environment:
       <<: *backend-env
       ALEMBIC_SKIP: "1"
@@ -95,7 +95,6 @@ services:
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL in .env}
-        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
     restart: unless-stopped
     depends_on:
       - backend

@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # --- Stage 1: install deps ---------------------------------------------------
-FROM node:20-slim AS deps
+FROM node:24-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
 # --- Stage 2: build -----------------------------------------------------------
-FROM node:20-slim AS builder
+FROM node:24-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -15,14 +15,12 @@ COPY . .
 # Baked into the client bundle at build time (Next.js public env vars are
 # resolved at build, not at container start) — override via --build-arg.
 ARG NEXT_PUBLIC_API_URL=http://localhost:8000
-ARG NEXT_PUBLIC_API_KEY=
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
-    NEXT_PUBLIC_API_KEY=$NEXT_PUBLIC_API_KEY
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
 RUN npm run build
 
 # --- Stage 3: runtime -----------------------------------------------------
-FROM node:20-slim AS runtime
+FROM node:24-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=5173 \
@@ -34,7 +32,7 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 
-# node:20-slim already ships a uid-1000 "node" user — reuse it instead of
+# node:24-slim already ships a uid-1000 "node" user — reuse it instead of
 # useradd'ing a new one (which collides on that uid).
 RUN chown -R node:node /app
 USER node

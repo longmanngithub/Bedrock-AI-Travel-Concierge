@@ -49,8 +49,8 @@ class User(Base):
     display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     # Personalization is OPT-IN (default off) — the defensible default.
     memory_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Completion email is enabled by default but can be disabled in Settings.
-    completion_email_opt_in: Mapped[bool] = mapped_column(Boolean, default=True)
+    memory_revision: Mapped[int] = mapped_column(Integer, default=0)
+    completion_email_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
     # Browser-geolocation-derived origin for flight pricing — OPT-IN (default
     # off), same posture as memory_opt_in (precise location is more sensitive
     # than a preference summary, not less).
@@ -64,6 +64,7 @@ class User(Base):
     # Set once the user completes the /start <code> deep-link flow with the
     # delivery bot (see delivery/telegram.py). NULL = not linked.
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
+    telegram_link_revision: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

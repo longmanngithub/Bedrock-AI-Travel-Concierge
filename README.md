@@ -104,6 +104,8 @@ crew/baseline directly and has no account or Redis dependency.
   Vertex AI. It also includes a Groq and Cloudflare profile for local development.
   See [model setup](#switching-llm-provider).
 
+For existing deployments, see the [security upgrade notes](docs/security-upgrade.md).
+
 ## Setup
 
 ### 1. Database + Redis

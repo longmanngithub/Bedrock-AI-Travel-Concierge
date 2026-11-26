@@ -8,7 +8,13 @@ Runs only when TELEGRAM_BOT_TOKEN is set — a no-op tick otherwise, same
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
+
+from sqlalchemy.exc import IntegrityError
+
+from ..models import User
 
 from ..database import SessionLocal
 from ..delivery.telegram import get_updates, is_configured, send_message
@@ -22,6 +28,10 @@ async def poll_telegram_updates(ctx: dict) -> None:
     if not is_configured():
         return
 
+    await asyncio.to_thread(_poll_updates)
+
+
+def _poll_updates() -> None:
     r = sync_redis()
     try:
         raw_offset = r.get(keys.TELEGRAM_OFFSET_KEY)
@@ -35,9 +45,11 @@ async def poll_telegram_updates(ctx: dict) -> None:
             text = (message.get("text") or "").strip()
             chat = message.get("chat") or {}
             chat_id = chat.get("id")
-            if chat_id is not None and text.startswith("/start"):
+            if chat_id is not None and chat.get("type") == "private" and text.split(maxsplit=1)[:1] == ["/start"]:
                 parts = text.split(maxsplit=1)
                 code = parts[1].strip() if len(parts) > 1 else ""
+                if not r.set(f"telegram:reply:{chat_id}", "1", ex=10, nx=True):
+                    continue
                 if code:
                     # Own session+commit per update (not one commit for the
                     # whole batch): a DB failure on one /start (e.g. the
@@ -59,26 +71,24 @@ async def poll_telegram_updates(ctx: dict) -> None:
 
         r.set(keys.TELEGRAM_OFFSET_KEY, updates[-1]["update_id"])
     except Exception:  # noqa: BLE001 - a poll tick must never crash the cron
-        logger.warning("telegram poll tick failed", exc_info=True)
+        logger.warning("telegram poll tick failed")
     finally:
         r.close()
 
 
 def _complete_link(db, r, *, code: str, chat_id: int) -> None:
-    from sqlalchemy.exc import IntegrityError
-
-    from ..models import User
-
-    raw_user_id = r.get(keys.telegram_link_key(code))
-    if raw_user_id is None:
+    raw_grant = r.getdel(keys.telegram_link_key(code))
+    if raw_grant is None:
         send_message(chat_id, "That link code has expired. Generate a new one from Bedrock's settings.")
         return
-    r.delete(keys.telegram_link_key(code))
-
-    user_id = raw_user_id.decode() if isinstance(raw_user_id, bytes) else raw_user_id
-    user = db.get(User, user_id)
-    if user is None:
+    grant = raw_grant.decode() if isinstance(raw_grant, bytes) else raw_grant
+    user_id, separator, revision = grant.partition(":")
+    if not separator:
+        return  # Grants issued before link revisions were introduced have expired.
+    user = db.get(User, uuid.UUID(user_id), with_for_update=True)
+    if user is None or str(user.telegram_link_revision) != revision:
         return
+    user.telegram_link_revision += 1
     user.telegram_chat_id = chat_id
     try:
         db.commit()

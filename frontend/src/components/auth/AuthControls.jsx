@@ -66,6 +66,23 @@ function AccountMenu({ user, onLogout, onClose }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [linkPassword, setLinkPassword] = useState("");
+
+  async function handleLink(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const { url } = await auth.linkGoogle(linkPassword);
+      window.location.assign(url);
+    } catch (err) {
+      setError(formatError(err));
+    } finally {
+      setLinkPassword("");
+      setBusy(false);
+    }
+  }
 
   async function handleUnlink() {
     setError("");
@@ -103,14 +120,22 @@ function AccountMenu({ user, onLogout, onClose }) {
             Google connected
           </div>
         )
-      ) : (
-        <a
-          href={auth.googleStartUrl("link")}
-          className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-ink transition hover:bg-surface-2"
-        >
-          <GoogleGlyph />
-          Connect Google account
-        </a>
+      ) : user.has_password && (
+        linkOpen ? (
+          <form onSubmit={handleLink} className="space-y-2 px-3 py-2.5">
+            <label htmlFor="google-link-password" className="block text-xs text-ink">Confirm your password</label>
+            <input id="google-link-password" type="password" required autoComplete="current-password"
+              value={linkPassword} onChange={(event) => setLinkPassword(event.target.value)}
+              className="w-full rounded-lg border border-line bg-canvas px-2 py-1.5 text-sm" />
+            <button type="submit" disabled={busy} className="text-xs font-medium text-brand">Continue with Google</button>
+          </form>
+        ) : (
+          <button type="button" onClick={() => setLinkOpen(true)}
+            className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm text-ink transition hover:bg-surface-2">
+            <GoogleGlyph />
+            Connect Google account
+          </button>
+        )
       )}
       {error && <p className="border-t border-line px-3 py-2 text-xs text-danger">{error}</p>}
       <button

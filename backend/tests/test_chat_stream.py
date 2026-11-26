@@ -16,7 +16,7 @@ class ChatStreamTests(unittest.TestCase):
         self.enterContext(patch.object(main.limiter, "enabled", False))
         self.client.cookies.set(CSRF_COOKIE, "test-token")
         self.enterContext(patch.dict(
-            main.app.dependency_overrides, {main.current_user: lambda: SimpleNamespace()}
+            main.app.dependency_overrides, {main.current_user: lambda: SimpleNamespace(location_share_opt_in=False)}
         ))
         self.model = Mock(model="groq/openai/gpt-oss-20b")
         self.enterContext(patch.object(conversation, "build_llm", return_value=self.model))

@@ -90,7 +90,7 @@ function passwordChecks(value) {
   ];
 }
 
-export default function AuthDialog({ onClose, onAuthed, dismissible = true, initialVerificationEmail, onVerificationRequired }) {
+export default function AuthDialog({ onClose, onAuthed, dismissible = true, initialVerificationEmail, onVerificationRequired, authNotice }) {
   const [mode, setMode] = useState(initialVerificationEmail ? "verify" : "login");
   const [email, setEmail] = useState(initialVerificationEmail || "");
   const [password, setPassword] = useState("");
@@ -123,19 +123,19 @@ export default function AuthDialog({ onClose, onAuthed, dismissible = true, init
     e.preventDefault();
     setError("");
     setNotice("");
-    if (mode === "register") {
+    if (mode === "verify") {
       if (!strong) return setError("Choose a stronger password before continuing.");
       if (password !== confirmPassword) return setError("Those passwords don't match.");
     }
     setBusy(true);
     try {
       if (mode === "verify") {
-        const user = await auth.verifyEmail(email, code);
+        const user = await auth.verifyEmail(email, code, password);
         onAuthed(user);
         return;
       }
       if (mode === "register") {
-        const result = await auth.register(email, password);
+        const result = await auth.register(email);
         setEmail(result.email || email);
         onVerificationRequired?.(result.email || email);
         switchMode("verify");
@@ -176,28 +176,28 @@ export default function AuthDialog({ onClose, onAuthed, dismissible = true, init
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={dismissible ? onClose : undefined}>
       <div className="w-full max-w-sm rounded-2xl border border-line bg-surface p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
         <h2 className="mb-1 text-lg font-semibold text-ink">{mode === "verify" ? "Verify your email" : mode === "login" ? "Welcome back" : "Create your account"}</h2>
-        <p className="mb-4 text-sm text-muted">{mode === "verify" ? "Enter the six-digit code we sent before accessing your saved trips." : "Sign in to save trips and sync across devices."}</p>
+        <p className="mb-4 text-sm text-muted">{mode === "verify" ? "Enter the code from your email and choose a password." : "Sign in to save trips and sync across devices."}</p>
 
         {mode !== "verify" && <>
-          <a href={auth.googleStartUrl("login")} className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-line bg-surface px-3 py-2.5 text-sm font-medium text-ink transition hover:bg-surface-2">
+          <a href={auth.googleStartUrl()} className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-line bg-surface px-3 py-2.5 text-sm font-medium text-ink transition hover:bg-surface-2">
             <GoogleGlyph /> Continue with Google
           </a>
           <div className="my-3 flex items-center gap-3 text-xs text-muted"><span className="h-px flex-1 bg-line" /> or <span className="h-px flex-1 bg-line" /></div>
         </>}
 
         <form onSubmit={submit} className="space-y-2.5">
-          <input type="email" required placeholder="you@example.com" value={email} autoComplete="email" readOnly={mode === "verify" && Boolean(initialVerificationEmail)} onChange={(e) => setEmail(e.target.value)} className="w-full rounded-xl border border-line bg-canvas px-3 py-2.5 text-sm text-ink outline-none focus:border-brand read-only:opacity-75" />
-          {mode === "verify" ? (
-            <VerificationCodeField value={code} onChange={setCode} disabled={busy} />
-          ) : <>
-            <PasswordField value={password} onChange={setPassword} placeholder="Password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "register" ? 12 : 1} />
-            {mode === "register" && <>
+          <input type="email" required placeholder="you@example.com" value={email} autoComplete="email" readOnly={mode === "verify"} onChange={(e) => setEmail(e.target.value)} className="w-full rounded-xl border border-line bg-canvas px-3 py-2.5 text-sm text-ink outline-none focus:border-brand read-only:opacity-75" />
+          {mode === "verify" && <VerificationCodeField value={code} onChange={setCode} disabled={busy} />}
+          {mode !== "register" && <>
+            <PasswordField value={password} onChange={setPassword} placeholder="Password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "verify" ? 12 : 1} />
+            {mode === "verify" && <>
               <ul className="grid grid-cols-2 gap-x-2 gap-y-1 px-1 text-[11px] text-muted">
                 {checks.map(([ok, label]) => <li key={label} className={ok ? "text-ok" : ""}>{ok ? "✓" : "•"} {label}</li>)}
               </ul>
               <PasswordField value={confirmPassword} onChange={setConfirmPassword} placeholder="Confirm password" autoComplete="new-password" minLength={12} />
             </>}
           </>}
+          {authNotice && <p role="status" className="text-sm text-danger">{authNotice.message}</p>}
           {notice && <p className="text-sm text-ok">{notice}</p>}
           {error && <p className="text-sm text-danger">{error}</p>}
           <button type="submit" disabled={busy || (mode === "verify" && code.length !== 6)} className="w-full rounded-xl bg-brand px-3 py-2.5 text-sm font-medium text-on-brand transition hover:bg-brand-strong disabled:opacity-60">
@@ -205,6 +205,7 @@ export default function AuthDialog({ onClose, onAuthed, dismissible = true, init
           </button>
         </form>
 
+        {mode === "verify" && <button type="button" onClick={() => switchMode("login")} className="mt-3 w-full text-center text-sm text-brand hover:underline">Back to sign in</button>}
         {mode === "verify" ? <button type="button" disabled={busy} onClick={resend} className="mt-3 w-full text-center text-sm text-brand hover:underline disabled:opacity-60">Resend code</button> : <button type="button" onClick={() => switchMode(mode === "login" ? "register" : "login")} className="mt-3 w-full text-center text-sm text-brand hover:underline">{mode === "login" ? "New here? Create an account" : "Already have an account? Sign in"}</button>}
       </div>
     </div>

@@ -5,12 +5,13 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..errors import AppError, ErrorCode
-from ..models import EmailVerification, User
+from ..models import EmailVerification, OAuthAccount, User
+from .passwords import hash_password
 
 
 def _now() -> datetime:
@@ -30,6 +31,17 @@ def issue_registration_code(db: Session, user: User, *, enforce_cooldown: bool =
     stored or logged.
     """
     settings = get_settings()
+    db.refresh(user, with_for_update=True)
+    if user.email_verified:
+        raise AppError(ErrorCode.E_EMAIL_TAKEN, log_detail="activation already completed")
+    now = _now()
+    recent_codes = db.scalar(select(func.count()).select_from(EmailVerification).where(
+        EmailVerification.user_id == user.id,
+        EmailVerification.purpose == "registration",
+        EmailVerification.sent_at >= now - timedelta(hours=1),
+    ))
+    if recent_codes >= 5:
+        raise AppError(ErrorCode.E_VERIFICATION_COOLDOWN, log_detail="hourly activation limit")
     latest = db.scalar(
         select(EmailVerification)
         .where(
@@ -39,7 +51,6 @@ def issue_registration_code(db: Session, user: User, *, enforce_cooldown: bool =
         )
         .order_by(EmailVerification.sent_at.desc())
     )
-    now = _now()
     if latest is not None:
         sent_at = latest.sent_at if latest.sent_at.tzinfo else latest.sent_at.replace(tzinfo=timezone.utc)
         if enforce_cooldown and (now - sent_at).total_seconds() < settings.otp_resend_cooldown_seconds:
@@ -80,8 +91,11 @@ def discard_registration_code(db: Session, user: User, code: str) -> None:
         db.commit()
 
 
-def verify_registration_code(db: Session, user: User, code: str) -> None:
+def verify_registration_code(db: Session, user: User, code: str, password: str) -> None:
     settings = get_settings()
+    db.refresh(user, with_for_update=True)
+    if user.email_verified:
+        raise AppError(ErrorCode.E_VERIFICATION_INVALID, log_detail="activation already completed")
     row = db.scalar(
         select(EmailVerification)
         .where(
@@ -109,5 +123,7 @@ def verify_registration_code(db: Session, user: User, code: str) -> None:
             log_detail="invalid OTP",
         )
     row.consumed_at = now
+    user.password_hash = hash_password(password)
     user.email_verified = True
-    db.commit()
+    # Pending accounts created before this change may contain an unproven link.
+    db.execute(delete(OAuthAccount).where(OAuthAccount.user_id == user.id))

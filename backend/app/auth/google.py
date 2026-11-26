@@ -86,15 +86,13 @@ def exchange_code(code: str, code_verifier: str) -> dict:
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPStatusError as exc:
-        # Google's actual reason (redirect_uri_mismatch, invalid_client,
-        # invalid_grant, ...) is in the response body, not the status line —
-        # `str(exc)` alone is useless for diagnosing a misconfigured client.
+        # Keep provider response bodies and credentials out of application logs.
         raise AppError(
             ErrorCode.E_OAUTH_FAILED,
-            log_detail=f"token exchange failed: HTTP {exc.response.status_code} body={exc.response.text[:500]}",
+            log_detail=f"token exchange failed: HTTP {exc.response.status_code}",
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise AppError(ErrorCode.E_OAUTH_FAILED, log_detail=f"token exchange failed: {exc!r}") from exc
+        raise AppError(ErrorCode.E_OAUTH_FAILED, log_detail=f"token exchange failed ({type(exc).__name__})") from exc
 
 
 def fetch_user_profile(access_token: str) -> dict[str, object]:
@@ -110,10 +108,10 @@ def fetch_user_profile(access_token: str) -> dict[str, object]:
     except httpx.HTTPStatusError as exc:
         raise AppError(
             ErrorCode.E_OAUTH_FAILED,
-            log_detail=f"userinfo fetch failed: HTTP {exc.response.status_code} body={exc.response.text[:500]}",
+            log_detail=f"userinfo fetch failed: HTTP {exc.response.status_code}",
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise AppError(ErrorCode.E_OAUTH_FAILED, log_detail=f"userinfo fetch failed: {exc!r}") from exc
+        raise AppError(ErrorCode.E_OAUTH_FAILED, log_detail=f"userinfo fetch failed ({type(exc).__name__})") from exc
     if not isinstance(profile, dict):
         raise AppError(ErrorCode.E_OAUTH_FAILED, log_detail="userinfo response was not an object")
     return profile

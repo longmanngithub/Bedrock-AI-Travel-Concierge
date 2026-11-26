@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- Stage 1: build a venv with all Python deps -----------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,22 +18,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY requirements.txt .
-
-# sentence-transformers (RAG embeddings) pulls in torch, which on PyPI
-# defaults to the CUDA build (~4-5 GB of unused nvidia-*/triton packages) —
-# a droplet has no GPU, so install the CPU-only wheel first; pip then finds
-# torch already satisfied and skips the CUDA variant when it hits
-# requirements.txt.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.lock
 
 # --- Stage 2: runtime image ---------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    HF_HOME=/opt/huggingface
 
 WORKDIR /app
 
@@ -55,14 +49,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --create-home --uid 1000 appuser
 
 COPY --from=builder /opt/venv /opt/venv
-COPY . .
+COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini entrypoint.sh ./
 
 # Build the local RAG vector store at image-build time (pure local
 # sentence-transformers embedding, no API key needed) so containers start
 # fast and don't re-embed the knowledge base on every boot.
 RUN python -m app.rag.ingest
 
-RUN chmod +x /app/entrypoint.sh && chown -R appuser:appuser /app
+RUN chmod +x /app/entrypoint.sh && chown -R appuser:appuser /app "$HF_HOME"
 USER appuser
 
 EXPOSE 8000
